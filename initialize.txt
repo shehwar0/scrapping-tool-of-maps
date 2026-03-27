@@ -1,0 +1,73 @@
+# 🛠️ How to Run This Project Locally
+
+## 1. Open Project Folder
+
+Open terminal inside the project folder.
+
+---
+
+## 2. Go to Backend Folder
+
+cd backend
+
+---
+
+## 3. Create Virtual Environment (only first time)
+
+python -m venv .venv
+
+---
+
+## 4. Activate Virtual Environment
+
+### PowerShell (Windows):
+
+..venv\Scripts\Activate.ps1
+
+---
+
+## 5. Install Dependencies (only first time)
+
+pip install flask playwright requests beautifulsoup4 lxml
+
+---
+
+## 6. Install Playwright Browser (IMPORTANT – only first time)
+
+python -m playwright install chromium
+
+---
+
+## 7. Run the App
+
+python app.py
+
+---
+
+## 8. Open in Browser
+
+http://127.0.0.1:5000
+
+---
+
+# ✅ Done!
+
+Now you can use the scraper UI.
+
+---
+
+# ⚠️ Notes
+
+* Steps 3, 5, 6 are only needed the first time
+* Next time, only do:
+
+  1. Activate venv
+  2. Run app
+
+---
+
+# ⚡ Quick Start (after first setup)
+
+cd backend
+..venv\Scripts\Activate.ps1
+python app.py

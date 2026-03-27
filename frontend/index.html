@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Business Intelligence Lead Generator</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section class="panel hero">
+      <h1>🎯 Deep Business Intelligence Lead Generator</h1>
+      <p>Multi-source extraction: Google Maps → Website → Google Search → Cross-verification</p>
+      <p style="font-size: 0.85em; opacity: 0.8;">Extracts: WhatsApp, Instagram, Facebook, Email, Tech Stack, and more.</p>
+    </section>
+
+    <section class="panel controls">
+      <div class="grid">
+        <label>
+          Keyword
+          <input id="keyword" type="text" placeholder="cafe, restaurant, dentist..." />
+        </label>
+        <label>
+          Location
+          <input id="location" type="text" placeholder="Islamabad, Lahore, Karachi..." />
+        </label>
+        <label>
+          Max Results (1-500)
+          <input id="maxResults" type="number" min="1" max="500" value="50" />
+        </label>
+        <label>
+          Website Filter
+          <select id="websiteFilter">
+            <option value="all" selected>Show all businesses (default)</option>
+            <option value="with">Only businesses with websites</option>
+            <option value="without">Only businesses without websites</option>
+          </select>
+        </label>
+        <label>
+          Extraction Mode
+          <select id="extractionMode">
+            <option value="ultra">🚀 Ultra Deep (ALL engines + Cross-verification)</option>
+            <option value="deep" selected>🔍 Deep (Maps + Website + Google Search)</option>
+            <option value="enhanced">⚙️ Enhanced (Maps + Website analysis)</option>
+            <option value="basic">⚡ Basic (Fastest, Maps only)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="mode-description" id="modeDescription">
+        <small>
+          <strong>Ultra Deep:</strong> Uses ALL extraction engines in parallel with cross-verification. Highest accuracy, slowest speed.
+        </small>
+      </div>
+
+      <div class="options">
+        <label class="checkbox-row">
+          <input id="headless" type="checkbox" />
+          Run browser in headless mode (faster, less visible)
+        </label>
+        <label class="checkbox-row">
+          <input id="deepSearch" type="checkbox" checked />
+          Enable Google Search cross-verification (finds more Instagram/social)
+        </label>
+        <label class="checkbox-row">
+          <input id="verifySocials" type="checkbox" checked />
+          Verify social media profiles exist (slower but accurate)
+        </label>
+        <label class="checkbox-row">
+          <input id="skipDuplicates" type="checkbox" checked />
+          🆕 Skip previously scraped businesses (get NEW results each time)
+        </label>
+      </div>
+
+      <div class="history-info" id="historyInfo" style="display:none;">
+        <small>
+          📊 Previously scraped: <span id="historyCount">0</span> businesses for this search
+          <button id="clearHistoryBtn" class="small-btn" title="Reset to get all results including previous ones">Clear History</button>
+        </small>
+      </div>
+
+      <div class="actions">
+        <button id="startBtn">🚀 Start Scraping</button>
+        <button id="stopBtn" class="secondary" disabled>⏹ Stop</button>
+        <button id="downloadBtn" class="secondary" disabled>📥 Download CSV</button>
+      </div>
+
+      <p id="status" class="status">Ready.</p>
+    </section>
+
+    <section class="panel stats-panel" id="statsPanel" style="display:none;">
+      <h3>📊 Extraction Stats</h3>
+      <div class="stats-grid">
+        <div class="stat"><span id="statTotal">0</span><label>Total</label></div>
+        <div class="stat"><span id="statWithEmail">0</span><label>With Email</label></div>
+        <div class="stat"><span id="statWithWhatsapp">0</span><label>With WhatsApp</label></div>
+        <div class="stat"><span id="statWithInstagram">0</span><label>Instagram</label></div>
+        <div class="stat"><span id="statWithFacebook">0</span><label>Facebook</label></div>
+        <div class="stat"><span id="statWithWebsite">0</span><label>Has Website</label></div>
+        <div class="stat"><span id="statVerified">0</span><label>Verified</label></div>
+      </div>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="table-wrap">
+        <table id="resultsTable">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Address</th>
+              <th>Phone</th>
+              <th>WhatsApp</th>
+              <th>Email</th>
+              <th>Website</th>
+              <th>Instagram</th>
+              <th>Facebook</th>
+              <th>Rating</th>
+              <th>Quality</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>

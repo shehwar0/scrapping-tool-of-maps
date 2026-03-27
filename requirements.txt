@@ -1,0 +1,17 @@
+# Core
+Flask==3.0.3
+playwright==1.51.0
+
+# HTML Parsing - Using selectolax for 25x faster parsing (C/Cython Lexbor engine)
+selectolax>=0.3.0
+lxml>=5.0.0
+
+# HTTP Client - Using httpx for async + HTTP/2 support
+httpx[http2]>=0.27.0
+
+# JSON - Using orjson for 10x faster serialization (Rust-based)
+orjson>=3.9.0
+
+# Legacy fallback
+beautifulsoup4==4.12.3
+requests==2.32.3
