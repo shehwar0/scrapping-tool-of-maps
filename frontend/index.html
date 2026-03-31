@@ -79,6 +79,19 @@
         </small>
       </div>
 
+      <div class="history-files" id="historyFilesPanel">
+        <div class="history-files-head">
+          <strong>History Files (Multi-Select)</strong>
+          <div class="history-files-actions">
+            <button id="refreshHistoryFilesBtn" type="button" class="small-btn">Refresh</button>
+            <button id="selectAllHistoryFilesBtn" type="button" class="small-btn">Select All</button>
+            <button id="clearSelectedHistoryFilesBtn" type="button" class="small-btn">Clear Selection</button>
+          </div>
+        </div>
+        <small>Select previous output files. Selected files ke businesses next scrape mein dobara include nahi honge.</small>
+        <div id="historyFilesList" class="history-files-list">Loading output history files...</div>
+      </div>
+
       <div class="actions">
         <button id="startBtn">🚀 Start Scraping</button>
         <button id="stopBtn" class="secondary" disabled>⏹ Stop</button>
@@ -110,6 +123,7 @@
               <th>Address</th>
               <th>Phone</th>
               <th>WhatsApp</th>
+              <th>WhatsApp Link</th>
               <th>Email</th>
               <th>Website</th>
               <th>Instagram</th>

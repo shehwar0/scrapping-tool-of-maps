@@ -11,6 +11,7 @@ Features:
 import json
 import os
 import hashlib
+import csv
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
@@ -85,6 +86,67 @@ class ScrapeHistory:
                 return ""
         
         return hashlib.md5(combined.encode()).hexdigest()
+
+    def get_business_id(self, business: Dict) -> str:
+        """Public helper to generate business ID from a business dictionary."""
+        return self._get_business_id(business)
+
+    def get_existing_business_ids(self, keyword: str = "", location: str = "") -> Set[str]:
+        """Return a snapshot of existing IDs currently in history."""
+        ids = set(self._global_history.keys())
+        if keyword and location:
+            search_key = self._get_search_key(keyword, location)
+            ids.update(self._load_search_history(search_key))
+        return ids
+
+    def import_output_files_to_history(self, file_paths: List[Path]) -> Tuple[int, Set[str]]:
+        """Import businesses from CSV output files into global history.
+
+        Returns:
+            A tuple of (newly_imported_count, all_ids_found_in_files)
+        """
+        imported = 0
+        file_business_ids: Set[str] = set()
+
+        for file_path in file_paths:
+            if not file_path.exists() or not file_path.is_file():
+                continue
+
+            try:
+                with open(file_path, "r", encoding="utf-8", newline="") as file:
+                    reader = csv.DictReader(file)
+                    for row in reader:
+                        business = {
+                            "name": (row.get("Name") or row.get("name") or "").strip(),
+                            "phone": (row.get("Phone") or row.get("phone") or "").strip(),
+                            "address": (row.get("Address") or row.get("address") or "").strip(),
+                            "google_maps_url": (row.get("Google Maps URL") or row.get("google_maps_url") or "").strip(),
+                        }
+
+                        business_id = self._get_business_id(business)
+                        if not business_id:
+                            continue
+
+                        file_business_ids.add(business_id)
+                        if business_id in self._global_history:
+                            continue
+
+                        self._global_history[business_id] = {
+                            "name": business.get("name", ""),
+                            "phone": business.get("phone", ""),
+                            "first_scraped": datetime.now().isoformat(),
+                            "keyword": "history_import",
+                            "location": file_path.name,
+                        }
+                        imported += 1
+            except Exception as e:
+                self.log.error(f"Failed to import history file {file_path.name}: {e}")
+
+        if imported > 0:
+            self._save_global_history()
+            self.log.info(f"Imported {imported} new businesses from selected output files")
+
+        return imported, file_business_ids
     
     def _get_search_history_file(self, search_key: str) -> Path:
         """Get the history file path for a specific search."""

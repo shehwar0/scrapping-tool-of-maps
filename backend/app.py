@@ -2,9 +2,10 @@ import csv
 import logging
 import os
 import re
+from pathlib import Path
 from datetime import datetime
 from threading import Event
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 from flask import Flask, jsonify, request, send_file
 
@@ -191,6 +192,13 @@ def get_previous_scraped() -> Dict:
     return jsonify({"count": len(previous), "businesses": previous})
 
 
+@app.get("/history/output-files")
+def get_output_history_files() -> Dict:
+    """List CSV output files that can be used as selectable history sources."""
+    files = _list_output_history_files()
+    return jsonify({"count": len(files), "files": files})
+
+
 @app.post("/scrape")
 def scrape() -> Dict:
     if SCRAPE_STATE["running"]:
@@ -213,6 +221,7 @@ def scrape() -> Dict:
     deep_search = bool(payload.get("deep_search", True))
     verify_socials = bool(payload.get("verify_socials", True))
     skip_duplicates = bool(payload.get("skip_duplicates", True))  # NEW: Skip previously scraped
+    selected_history_files = _normalize_history_file_selection(payload.get("selected_history_files"))
 
     try:
         requested_max_results = int(payload.get("max_results", 50))
@@ -232,6 +241,25 @@ def scrape() -> Dict:
         "ultra": "Ultra Deep (ALL engines + Cross-verification)",
     }
     mode_desc = mode_descriptions.get(extraction_mode, extraction_mode)
+    exclusion_business_ids: Set[str] = set()
+    excluded_by_history = 0
+
+    if skip_duplicates and scrape_history:
+        exclusion_business_ids.update(scrape_history.get_existing_business_ids(keyword, location))
+
+    if selected_history_files and scrape_history:
+        selected_paths = [Path(os.path.join(OUTPUT_DIR, name)) for name in selected_history_files]
+        imported_count, selected_ids = scrape_history.import_output_files_to_history(selected_paths)
+        exclusion_business_ids.update(selected_ids)
+        log.info(
+            "Using %d selected output files for exclusion (%d IDs, %d newly imported)",
+            len(selected_history_files),
+            len(selected_ids),
+            imported_count,
+        )
+        mode_desc += f" + selected-files({len(selected_history_files)})"
+    elif selected_history_files:
+        log.warning("Selected history files were provided, but history manager is unavailable")
     
     # Add deduplication info
     if skip_duplicates and scrape_history:
@@ -310,6 +338,29 @@ def scrape() -> Dict:
                 return jsonify({"error": "No scraper available"}), 500
         
         results = scraper.scrape(keyword=keyword, location=location, stop_event=STOP_EVENT)
+
+        if exclusion_business_ids and scrape_history:
+            filtered_results = []
+            for lead in results:
+                if not isinstance(lead, dict):
+                    filtered_results.append(lead)
+                    continue
+                business_id = scrape_history.get_business_id(lead)
+                if business_id and business_id in exclusion_business_ids:
+                    excluded_by_history += 1
+                    continue
+                filtered_results.append(lead)
+            results = filtered_results
+            if excluded_by_history > 0:
+                log.info("Excluded %d leads using selected/history files", excluded_by_history)
+
+        for lead in results:
+            if isinstance(lead, dict):
+                lead["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead)
+
+        if scrape_history and results:
+            scrape_history.add_batch_to_history(results, keyword, location)
+
         SCRAPE_STATE["results"] = results
         log.info("Scraping completed. Found %d results", len(results))
 
@@ -322,7 +373,10 @@ def scrape() -> Dict:
             SCRAPE_STATE["message"] = "Scrape stopped by user"
         else:
             SCRAPE_STATE["status"] = "completed"
-            SCRAPE_STATE["message"] = f"Completed. {len(results)} leads collected"
+            if excluded_by_history > 0:
+                SCRAPE_STATE["message"] = f"Completed. {len(results)} leads collected ({excluded_by_history} skipped from selected/history files)"
+            else:
+                SCRAPE_STATE["message"] = f"Completed. {len(results)} leads collected"
 
         return jsonify(
             {
@@ -331,6 +385,8 @@ def scrape() -> Dict:
                 "count": len(results),
                 "results": results,
                 "csv_file": os.path.basename(csv_path),
+                "history_files_used": selected_history_files,
+                "history_skipped": excluded_by_history,
             }
         )
     except CaptchaDetectedError as exc:
@@ -367,6 +423,7 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
     # Enhanced CSV with all extracted fields including verification data
     fieldnames = [
         "Name", "Phone", "Email", "All Emails", "WhatsApp", "All WhatsApp",
+        "WhatsApp wa.me Links",
         "Website", "Has Website", "Address", "Rating", "Reviews",
         "Category", "Business Hours",
         "Instagram", "Facebook", "Twitter", "LinkedIn", "TikTok", "YouTube",
@@ -388,6 +445,7 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
                         "All Emails": lead.get("all_emails", ""),
                         "WhatsApp": lead.get("whatsapp", ""),
                         "All WhatsApp": lead.get("all_whatsapp", ""),
+                        "WhatsApp wa.me Links": _build_whatsapp_wa_me_links(lead),
                         "Website": lead.get("website", ""),
                         "Has Website": lead.get("has_website", ""),
                         "Address": lead.get("address", ""),
@@ -419,6 +477,100 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
         raise
 
     return path
+
+
+def _list_output_history_files() -> List[Dict[str, str]]:
+    files: List[Dict[str, str]] = []
+
+    try:
+        for entry in os.scandir(OUTPUT_DIR):
+            if not entry.is_file() or not entry.name.lower().endswith(".csv"):
+                continue
+
+            stat = entry.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime)
+            files.append(
+                {
+                    "name": entry.name,
+                    "size_bytes": stat.st_size,
+                    "rows": _count_csv_rows(entry.path),
+                    "modified": modified.strftime("%Y-%m-%d %H:%M:%S"),
+                    "modified_ts": stat.st_mtime,
+                }
+            )
+    except Exception as exc:
+        log.warning("Failed listing output history files: %s", exc)
+        return []
+
+    files.sort(key=lambda item: item.get("modified_ts", 0), reverse=True)
+    for item in files:
+        item.pop("modified_ts", None)
+    return files
+
+
+def _count_csv_rows(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as file:
+            row_count = sum(1 for _ in csv.reader(file))
+            return max(0, row_count - 1)
+    except Exception:
+        return 0
+
+
+def _normalize_history_file_selection(raw_files: Optional[object]) -> List[str]:
+    if not isinstance(raw_files, list):
+        return []
+
+    selected: List[str] = []
+    seen: Set[str] = set()
+    for raw in raw_files:
+        if not isinstance(raw, str):
+            continue
+
+        name = os.path.basename(raw.strip())
+        if not name or not name.lower().endswith(".csv"):
+            continue
+
+        full_path = os.path.join(OUTPUT_DIR, name)
+        if not os.path.isfile(full_path):
+            continue
+
+        if name in seen:
+            continue
+        seen.add(name)
+        selected.append(name)
+
+    return selected
+
+
+def _build_whatsapp_wa_me_links(lead: Dict[str, str]) -> str:
+    """Build wa.me links from extracted WhatsApp numbers."""
+    raw_values = [
+        str(lead.get("all_whatsapp", "") or ""),
+        str(lead.get("whatsapp", "") or ""),
+    ]
+
+    numbers: List[str] = []
+    seen = set()
+
+    for raw in raw_values:
+        if not raw:
+            continue
+
+        candidates = re.findall(r"\+?\d[\d\s()\-.]{6,}\d", raw)
+        if not candidates:
+            candidates = [raw]
+
+        for candidate in candidates:
+            digits = re.sub(r"\D", "", candidate)
+            if len(digits) < 8:
+                continue
+            if digits in seen:
+                continue
+            seen.add(digits)
+            numbers.append(digits)
+
+    return "; ".join(f"https://wa.me/{number}" for number in numbers)
 
 
 def _sanitize_token(value: str) -> str:

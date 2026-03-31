@@ -9,9 +9,15 @@ const extractionModeSelect = document.getElementById("extractionMode");
 const historyInfo = document.getElementById("historyInfo");
 const historyCount = document.getElementById("historyCount");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+const historyFilesList = document.getElementById("historyFilesList");
+const refreshHistoryFilesBtn = document.getElementById("refreshHistoryFilesBtn");
+const selectAllHistoryFilesBtn = document.getElementById("selectAllHistoryFilesBtn");
+const clearSelectedHistoryFilesBtn = document.getElementById("clearSelectedHistoryFilesBtn");
 const MAX_RESULTS_LIMIT = 500;
 
 let pollingId = null;
+let outputHistoryFiles = [];
+const selectedHistoryFiles = new Set();
 
 // Mode descriptions for the UI
 const modeDescriptions = {
@@ -94,9 +100,100 @@ async function clearHistory() {
   }
 }
 
+async function fetchOutputHistoryFiles() {
+  if (!historyFilesList) {
+    return;
+  }
+
+  try {
+    const res = await fetch("/history/output-files");
+    const data = await res.json();
+    outputHistoryFiles = Array.isArray(data.files) ? data.files : [];
+
+    const availableNames = new Set(outputHistoryFiles.map((file) => file.name));
+    for (const selected of [...selectedHistoryFiles]) {
+      if (!availableNames.has(selected)) {
+        selectedHistoryFiles.delete(selected);
+      }
+    }
+
+    renderOutputHistoryFiles();
+  } catch {
+    historyFilesList.innerHTML = "Could not load output history files.";
+  }
+}
+
+function renderOutputHistoryFiles() {
+  if (!historyFilesList) {
+    return;
+  }
+
+  historyFilesList.innerHTML = "";
+
+  if (!outputHistoryFiles.length) {
+    historyFilesList.textContent = "No output CSV files found yet.";
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+
+  outputHistoryFiles.forEach((file) => {
+    const row = document.createElement("label");
+    row.className = "history-file-row";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selectedHistoryFiles.has(file.name);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        selectedHistoryFiles.add(file.name);
+      } else {
+        selectedHistoryFiles.delete(file.name);
+      }
+    });
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "history-file-name";
+    nameEl.textContent = file.name;
+
+    const metaEl = document.createElement("small");
+    metaEl.className = "history-file-meta";
+    metaEl.textContent = `${file.rows || 0} rows | ${file.modified || "unknown"}`;
+
+    row.appendChild(checkbox);
+    row.appendChild(nameEl);
+    row.appendChild(metaEl);
+    fragment.appendChild(row);
+  });
+
+  historyFilesList.appendChild(fragment);
+}
+
+function getSelectedHistoryFiles() {
+  return [...selectedHistoryFiles];
+}
+
 // Set up history listeners
 if (clearHistoryBtn) {
   clearHistoryBtn.addEventListener("click", clearHistory);
+}
+
+if (refreshHistoryFilesBtn) {
+  refreshHistoryFilesBtn.addEventListener("click", fetchOutputHistoryFiles);
+}
+
+if (selectAllHistoryFilesBtn) {
+  selectAllHistoryFilesBtn.addEventListener("click", () => {
+    outputHistoryFiles.forEach((file) => selectedHistoryFiles.add(file.name));
+    renderOutputHistoryFiles();
+  });
+}
+
+if (clearSelectedHistoryFilesBtn) {
+  clearSelectedHistoryFilesBtn.addEventListener("click", () => {
+    selectedHistoryFiles.clear();
+    renderOutputHistoryFiles();
+  });
 }
 
 // Check history when keyword/location changes
@@ -161,7 +258,7 @@ function renderRows(rows) {
 
   if (!rows || rows.length === 0) {
     const tr = document.createElement("tr");
-    tr.innerHTML = "<td colspan='10'>No results yet.</td>";
+    tr.innerHTML = "<td colspan='11'>No results yet.</td>";
     bodyEl.appendChild(tr);
     return;
   }
@@ -194,16 +291,23 @@ function renderRows(rows) {
     const qualityClass = row.quality_score === "high" ? "quality-high" : row.quality_score === "medium" ? "quality-medium" : "quality-low";
     const qualityCell = `<span class="quality ${qualityClass}">${(row.quality_score || "?").toUpperCase()}</span>`;
 
-    // WhatsApp with link
-    const whatsappCell = row.whatsapp 
-      ? `<a href="https://wa.me/${row.whatsapp.replace(/[^0-9]/g, '')}" target="_blank" title="Open WhatsApp">📱 ${row.whatsapp}</a>`
-      : "—";
+    const whatsappCell = row.whatsapp || "—";
+
+    const waMeLinks = (row.whatsapp_wa_me_links || "").split(";").map((entry) => entry.trim()).filter(Boolean);
+    const whatsappLinkCell = waMeLinks.length > 0
+      ? waMeLinks
+          .map((link) => `<a href="${link}" target="_blank" rel="noopener noreferrer" title="Open WhatsApp">Open</a>`)
+          .join(" | ")
+      : (row.whatsapp
+          ? `<a href="https://wa.me/${row.whatsapp.replace(/[^0-9]/g, "")}" target="_blank" rel="noopener noreferrer" title="Open WhatsApp">Open</a>`
+          : "—");
 
     tr.innerHTML = `
       <td title="${row.name || ''}">${truncate(row.name, 25) || "—"}</td>
       <td>${addressCell}</td>
       <td>${row.phone || "—"}</td>
       <td>${whatsappCell}</td>
+      <td>${whatsappLinkCell}</td>
       <td>${row.email || "—"}</td>
       <td>${websiteCell}</td>
       <td>${instagramCell}</td>
@@ -259,6 +363,7 @@ startBtn.addEventListener("click", async () => {
   const deepSearch = document.getElementById("deepSearch").checked;
   const verifySocials = document.getElementById("verifySocials")?.checked ?? true;
   const skipDuplicates = document.getElementById("skipDuplicates")?.checked ?? true;
+  const chosenHistoryFiles = getSelectedHistoryFiles();
 
   maxResultsInput.value = String(maxResults);
 
@@ -278,6 +383,9 @@ startBtn.addEventListener("click", async () => {
   let statusMsg = modeNames[extractionMode] || "Scraping...";
   if (skipDuplicates) {
     statusMsg += " (skipping previous results)";
+  }
+  if (chosenHistoryFiles.length > 0) {
+    statusMsg += ` + ${chosenHistoryFiles.length} selected history file(s)`;
   }
   
   setRunningState(true);
@@ -299,6 +407,7 @@ startBtn.addEventListener("click", async () => {
         deep_search: deepSearch,
         verify_socials: verifySocials,
         skip_duplicates: skipDuplicates,
+        selected_history_files: chosenHistoryFiles,
         headless,
       }),
     });
@@ -315,6 +424,7 @@ startBtn.addEventListener("click", async () => {
     
     // Refresh history stats after scraping
     fetchHistoryStats();
+    fetchOutputHistoryFiles();
   } catch (err) {
     setStatus("Network error while scraping. Check backend logs.");
   } finally {
@@ -338,3 +448,4 @@ downloadBtn.addEventListener("click", () => {
 });
 
 renderRows([]);
+fetchOutputHistoryFiles();
