@@ -18,7 +18,7 @@ import time
 import concurrent.futures
 from dataclasses import dataclass, field
 from threading import Event, Lock
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Callable, Dict, List, Optional, Set, Tuple, Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
@@ -485,6 +485,7 @@ class UltraDeepScraper:
         verify_socials: bool = True,
         skip_duplicates: bool = True,  # NEW: Skip previously scraped businesses
         logger: Optional[logging.Logger] = None,
+        progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
         self.max_results = max(1, min(max_results, MAX_RESULTS_CAP))
         self.headless = headless
@@ -495,6 +496,9 @@ class UltraDeepScraper:
         self.verify_socials = verify_socials
         self.skip_duplicates = skip_duplicates
         self.log = logger or logging.getLogger(__name__)
+        self.progress_callback = progress_callback
+        self._website_engine_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._google_verify_cache: Dict[str, Optional[Dict]] = {}
         
         # Initialize extraction engines
         self.deep_engine = DeepExtractionEngine(logger)
@@ -671,8 +675,11 @@ class UltraDeepScraper:
         # Increase max stagnant rounds to scroll deeper when looking for new results
         max_stagnant_rounds = 20 if self.skip_duplicates else (14 if self.max_results > 100 else 8)
         
-        # We need to collect MORE URLs than requested to account for duplicates
-        target_urls = self.max_results * 3 if self.skip_duplicates else self.max_results
+        # Keep a small duplicate buffer without multiplying runtime.
+        duplicate_buffer = 0
+        if self.skip_duplicates:
+            duplicate_buffer = min(12, max(2, self.max_results // 12))
+        target_urls = self.max_results + duplicate_buffer
 
         current_url = page.url or ""
         if "/maps/place/" in current_url:
@@ -709,10 +716,10 @@ class UltraDeepScraper:
             except Exception:
                 page.mouse.wheel(0, 4000)
 
-            self._human_delay(0.5, 1.0)
+            self._human_delay(0.3, 0.6)
             self._raise_if_captcha(page)
 
-        self.log.info("📍 Discovered %d place URLs total", len(discovered))
+        self.log.info("📍 Discovered %d place URLs total (target %d)", len(discovered), self.max_results)
         
         # If deduplication is enabled, we'll filter in _ultra_extract_leads
         # Return more URLs so we have room to filter
@@ -741,8 +748,13 @@ class UltraDeepScraper:
                 break
 
             processed += 1
-            self.log.info("🔍 Ultra Processing %d/%d (Found: %d new, Skipped: %d duplicates)", 
-                         processed, len(place_urls), len(leads), skipped_duplicates)
+            self.log.info(
+                "🔍 Ultra candidate %d (Collected: %d/%d, Skipped: %d duplicates)",
+                processed,
+                len(leads),
+                self.max_results,
+                skipped_duplicates,
+            )
 
             page = context.new_page()
             try:
@@ -762,6 +774,12 @@ class UltraDeepScraper:
                         leads.append(lead)
                         self.log.info("✓ NEW: %s (Quality: %s, Verified: %d%%)", 
                                      lead.name, lead.extraction_quality, lead.verification_score)
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(lead.to_dict())
+                            except Exception:
+                                # Progress callbacks should never interrupt scraping.
+                                pass
             except CaptchaDetectedError:
                 raise
             except Exception as e:
@@ -769,7 +787,7 @@ class UltraDeepScraper:
             finally:
                 page.close()
 
-            self._human_delay()
+            self._human_delay(0.2, 0.5)
 
         return leads
 
@@ -878,7 +896,11 @@ class UltraDeepScraper:
 
                 # ===== PHASE 2: Multi-Engine Website Analysis =====
                 if data.website:
-                    engine_results = self._multi_engine_website_analysis(page, data.website, data.phone)
+                    cache_key = self._website_cache_key(data.website)
+                    engine_results = self._website_engine_cache.get(cache_key)
+                    if engine_results is None:
+                        engine_results = self._multi_engine_website_analysis(page, data.website, data.phone)
+                        self._website_engine_cache[cache_key] = list(engine_results)
                     
                     # Cross-verify results
                     verified = self.verifier.merge_and_verify(engine_results)
@@ -910,8 +932,20 @@ class UltraDeepScraper:
                     data.is_automated = data.has_chatbot
 
                 # ===== PHASE 3: Google Search Cross-Verification =====
-                if data.name:
-                    google_data = self._google_search_verify(page, data.name, location)
+                needs_google_lookup = (
+                    data.name
+                    and (
+                        not data.instagram
+                        or not data.facebook
+                        or not data.whatsapp_numbers
+                        or not data.emails
+                    )
+                )
+                if needs_google_lookup:
+                    google_key = f"{data.name.strip().lower()}|{location.strip().lower()}"
+                    if google_key not in self._google_verify_cache:
+                        self._google_verify_cache[google_key] = self._google_search_verify(page, data.name, location)
+                    google_data = self._google_verify_cache.get(google_key)
                     if google_data:
                         data.data_sources.append("google_search")
                         
@@ -1020,6 +1054,16 @@ class UltraDeepScraper:
             self.log.debug("Email engine error: %s", e)
 
         return results
+
+    def _website_cache_key(self, website_url: str) -> str:
+        if not website_url:
+            return ""
+        normalized = website_url if website_url.startswith(("http://", "https://")) else f"https://{website_url}"
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or parsed.path).lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
 
     def _google_search_verify(self, page: Page, business_name: str, location: str) -> Optional[Dict]:
         """Search Google for additional verification."""

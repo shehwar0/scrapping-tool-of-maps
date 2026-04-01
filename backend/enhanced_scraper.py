@@ -8,8 +8,8 @@ import random
 import re
 import time
 from threading import Event
-from typing import Dict, List, Optional, Set
-from urllib.parse import quote_plus
+from typing import Callable, Dict, List, Optional, Set
+from urllib.parse import quote_plus, urlparse
 
 import asyncio
 
@@ -42,6 +42,7 @@ class EnhancedGoogleMapsScraper:
         website_filter: str = "all",
         logger: Optional[logging.Logger] = None,
         concurrent_extractions: int = 3,
+        progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
         self.max_results = max(1, min(max_results, MAX_RESULTS_CAP))
         self.headless = headless
@@ -50,6 +51,8 @@ class EnhancedGoogleMapsScraper:
         self.website_filter = website_filter if website_filter in {"all", "with", "without"} else "all"
         self.log = logger or logging.getLogger(__name__)
         self.concurrent_extractions = concurrent_extractions
+        self.progress_callback = progress_callback
+        self._website_cache: Dict[str, Dict] = {}
     
     async def scrape(
         self,
@@ -187,7 +190,7 @@ class EnhancedGoogleMapsScraper:
         seen: Set[str] = set()
         stagnant_rounds = 0
         max_stagnant_rounds = 14 if self.max_results > 100 else 8
-        scroll_delay_min, scroll_delay_max = (0.45, 0.9) if self.max_results > 100 else (self.min_delay, self.max_delay)
+        scroll_delay_min, scroll_delay_max = (0.25, 0.5) if self.max_results > 100 else (0.3, 0.6)
         
         current_url = page.url or ""
         if "/maps/place/" in current_url:
@@ -273,10 +276,16 @@ class EnhancedGoogleMapsScraper:
                     if self._passes_website_filter(lead.website):
                         lead.extraction_quality = lead.calculate_quality()
                         leads.append(lead)
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(lead.to_dict())
+                            except Exception:
+                                # Progress callbacks should never interrupt scraping.
+                                pass
             finally:
                 await page.close()
             
-            await self._human_delay()
+            await self._human_delay(0.2, 0.45)
         
         return leads
     
@@ -320,7 +329,11 @@ class EnhancedGoogleMapsScraper:
                 
                 # If has website, extract additional data
                 if data.website:
-                    website_data = await self._analyze_website(page, data.website)
+                    cache_key = self._website_cache_key(data.website)
+                    website_data = self._website_cache.get(cache_key)
+                    if website_data is None:
+                        website_data = await self._analyze_website(page, data.website)
+                        self._website_cache[cache_key] = dict(website_data)
                     
                     # Merge website data
                     data.emails = website_data.get("emails", [])
@@ -543,6 +556,16 @@ class EnhancedGoogleMapsScraper:
             pass
         
         return socials
+
+    def _website_cache_key(self, website_url: str) -> str:
+        if not website_url:
+            return ""
+        normalized = website_url if website_url.startswith(("http://", "https://")) else f"https://{website_url}"
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or parsed.path).lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
     
     async def _analyze_website(self, page: Page, website_url: str) -> Dict:
         """Navigate to website and analyze for contact info and tech stack."""

@@ -18,6 +18,19 @@ const MAX_RESULTS_LIMIT = 500;
 let pollingId = null;
 let outputHistoryFiles = [];
 const selectedHistoryFiles = new Set();
+let activeScrapeController = null;
+let stopRequestedByUser = false;
+let lastRenderedCount = 0;
+let backendCooldownUntil = 0;
+
+function canCallBackend() {
+  return Date.now() >= backendCooldownUntil;
+}
+
+function markBackendUnavailable(message = "Backend is offline. Start server with run.txt command.") {
+  backendCooldownUntil = Date.now() + 5000;
+  setStatus(message);
+}
 
 // Mode descriptions for the UI
 const modeDescriptions = {
@@ -45,6 +58,10 @@ if (extractionModeSelect) {
 // ============================================================================
 
 async function fetchHistoryStats() {
+  if (!canCallBackend()) {
+    return;
+  }
+
   const keyword = document.getElementById("keyword").value.trim();
   const location = document.getElementById("location").value.trim();
   
@@ -64,11 +81,17 @@ async function fetchHistoryStats() {
       historyInfo.style.display = "none";
     }
   } catch {
+    markBackendUnavailable();
     historyInfo.style.display = "none";
   }
 }
 
 async function clearHistory() {
+  if (!canCallBackend()) {
+    markBackendUnavailable();
+    return;
+  }
+
   const keyword = document.getElementById("keyword").value.trim();
   const location = document.getElementById("location").value.trim();
   
@@ -96,11 +119,16 @@ async function clearHistory() {
       setStatus(`Error: ${data.error || "Failed to clear history"}`);
     }
   } catch {
+    markBackendUnavailable();
     setStatus("Error clearing history.");
   }
 }
 
 async function fetchOutputHistoryFiles() {
+  if (!canCallBackend()) {
+    return;
+  }
+
   if (!historyFilesList) {
     return;
   }
@@ -119,6 +147,7 @@ async function fetchOutputHistoryFiles() {
 
     renderOutputHistoryFiles();
   } catch {
+    markBackendUnavailable();
     historyFilesList.innerHTML = "Could not load output history files.";
   }
 }
@@ -260,6 +289,7 @@ function renderRows(rows) {
     const tr = document.createElement("tr");
     tr.innerHTML = "<td colspan='11'>No results yet.</td>";
     bodyEl.appendChild(tr);
+    lastRenderedCount = 0;
     return;
   }
 
@@ -318,6 +348,8 @@ function renderRows(rows) {
 
     bodyEl.appendChild(tr);
   });
+
+  lastRenderedCount = rows.length;
 }
 
 function normalizeMaxResults(value) {
@@ -329,14 +361,38 @@ function normalizeMaxResults(value) {
 }
 
 async function fetchStatus() {
+  if (!canCallBackend()) {
+    return;
+  }
+
   try {
     const res = await fetch("/status");
     const data = await res.json();
+
+    if (Array.isArray(data?.results) && data.results.length !== lastRenderedCount) {
+      renderRows(data.results);
+      downloadBtn.disabled = !(data.results.length > 0);
+    }
+
     if (data?.message) {
       setStatus(data.message);
     }
+
+    if (data && data.running === false && pollingId) {
+      setRunningState(false);
+      stopPolling();
+      stopRequestedByUser = false;
+      activeScrapeController = null;
+      downloadBtn.disabled = !(data.count > 0);
+      fetchHistoryStats();
+      fetchOutputHistoryFiles();
+    }
   } catch {
-    // Keep existing UI status if polling fails.
+    markBackendUnavailable("Backend connection lost. Please restart server.");
+    setRunningState(false);
+    stopPolling();
+    stopRequestedByUser = false;
+    activeScrapeController = null;
   }
 }
 
@@ -391,6 +447,8 @@ startBtn.addEventListener("click", async () => {
   setRunningState(true);
   downloadBtn.disabled = true;
   renderRows([]);
+  stopRequestedByUser = false;
+  activeScrapeController = new AbortController();
   setStatus(statusMsg);
   startPolling();
 
@@ -398,6 +456,7 @@ startBtn.addEventListener("click", async () => {
     const res = await fetch("/scrape", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: activeScrapeController.signal,
       body: JSON.stringify({
         keyword,
         location,
@@ -415,30 +474,66 @@ startBtn.addEventListener("click", async () => {
     const data = await res.json();
     if (!res.ok) {
       setStatus(data.error || "Scraping failed.");
+      stopRequestedByUser = false;
       return;
     }
 
     renderRows(data.results || []);
     setStatus(data.message || `Completed. ${data.count || 0} NEW leads collected.`);
     downloadBtn.disabled = !(data.count > 0);
+    stopRequestedByUser = false;
     
     // Refresh history stats after scraping
     fetchHistoryStats();
     fetchOutputHistoryFiles();
   } catch (err) {
-    setStatus("Network error while scraping. Check backend logs.");
+    if (err?.name === "AbortError" && stopRequestedByUser) {
+      setStatus("Stopping... returning collected results.");
+      startPolling();
+    } else {
+      markBackendUnavailable();
+      setStatus("Network error while scraping. Check backend logs.");
+      stopRequestedByUser = false;
+    }
   } finally {
-    setRunningState(false);
-    stopPolling();
+    activeScrapeController = null;
+    if (!stopRequestedByUser) {
+      setRunningState(false);
+      stopPolling();
+    }
   }
 });
 
 stopBtn.addEventListener("click", async () => {
+  if (!canCallBackend()) {
+    markBackendUnavailable();
+    return;
+  }
+
+  stopRequestedByUser = true;
+
+  if (activeScrapeController) {
+    try {
+      activeScrapeController.abort();
+    } catch {
+      // Ignore abort errors.
+    }
+  }
+
+  startPolling();
+
   try {
     const res = await fetch("/stop", { method: "POST" });
     const data = await res.json();
+
+    if (Array.isArray(data?.results)) {
+      renderRows(data.results);
+      downloadBtn.disabled = !(data.results.length > 0);
+    }
+
     setStatus(data.message || "Stop requested.");
   } catch {
+    markBackendUnavailable();
     setStatus("Could not send stop request.");
   }
 });

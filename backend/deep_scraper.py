@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from threading import Event
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
@@ -480,6 +480,7 @@ class DeepBusinessScraper:
         deep_search: bool = True,
         skip_duplicates: bool = True,  # NEW: Skip previously scraped businesses
         logger: Optional[logging.Logger] = None,
+        progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
         self.max_results = max(1, min(max_results, MAX_RESULTS_CAP))
         self.headless = headless
@@ -489,6 +490,9 @@ class DeepBusinessScraper:
         self.deep_search = deep_search
         self.skip_duplicates = skip_duplicates
         self.log = logger or logging.getLogger(__name__)
+        self.progress_callback = progress_callback
+        self._website_cache: Dict[str, Dict] = {}
+        self._google_cache: Dict[str, Optional[Dict]] = {}
         
         # Initialize history manager for deduplication
         try:
@@ -638,8 +642,11 @@ class DeepBusinessScraper:
         # Increase stagnant rounds when looking for new results
         max_stagnant_rounds = 20 if self.skip_duplicates else (14 if self.max_results > 100 else 8)
         
-        # Collect more URLs to account for duplicates being filtered
-        target_urls = self.max_results * 3 if self.skip_duplicates else self.max_results
+        # Keep a small buffer for duplicates without tripling work and runtime.
+        duplicate_buffer = 0
+        if self.skip_duplicates:
+            duplicate_buffer = min(12, max(2, self.max_results // 12))
+        target_urls = self.max_results + duplicate_buffer
 
         current_url = page.url or ""
         if "/maps/place/" in current_url:
@@ -692,10 +699,10 @@ class DeepBusinessScraper:
             except Exception:
                 page.mouse.wheel(0, 4000)
 
-            self._human_delay(0.5, 1.0)
+            self._human_delay(0.3, 0.6)
             self._raise_if_captcha(page)
 
-        self.log.info("📍 Discovered %d place URLs", len(discovered))
+        self.log.info("📍 Discovered %d place URLs (target %d)", len(discovered), self.max_results)
         return discovered
 
     def _collect_lead_details(
@@ -721,8 +728,13 @@ class DeepBusinessScraper:
                 break
 
             processed += 1
-            self.log.info("🔍 Processing %d/%d (Found: %d new, Skipped: %d duplicates)", 
-                         processed, len(place_urls), len(leads), skipped_duplicates)
+            self.log.info(
+                "🔍 Processing candidate %d (Collected: %d/%d, Skipped: %d duplicates)",
+                processed,
+                len(leads),
+                self.max_results,
+                skipped_duplicates,
+            )
 
             page = context.new_page()
             try:
@@ -740,6 +752,12 @@ class DeepBusinessScraper:
                         lead.extraction_quality = lead.calculate_quality()
                         leads.append(lead)
                         self.log.info("✓ NEW: %s (Quality: %s)", lead.name, lead.extraction_quality)
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(lead.to_dict())
+                            except Exception:
+                                # Progress callbacks should never interrupt scraping.
+                                pass
             except CaptchaDetectedError:
                 raise
             except Exception as e:
@@ -747,7 +765,7 @@ class DeepBusinessScraper:
             finally:
                 page.close()
 
-            self._human_delay()
+            self._human_delay(0.2, 0.5)
         
         self.log.info(f"📊 Summary: {len(leads)} new businesses, {skipped_duplicates} duplicates skipped")
         return leads
@@ -797,7 +815,11 @@ class DeepBusinessScraper:
 
                 # ===== STEP 2: Analyze website if available =====
                 if data.website:
-                    website_data = self._deep_analyze_website(page, data.website)
+                    cache_key = self._website_cache_key(data.website)
+                    website_data = self._website_cache.get(cache_key)
+                    if website_data is None:
+                        website_data = self._deep_analyze_website(page, data.website)
+                        self._website_cache[cache_key] = dict(website_data)
                     data.data_sources.append("website")
                     
                     # Merge website data
@@ -826,8 +848,21 @@ class DeepBusinessScraper:
                     data.is_automated = data.has_chatbot
 
                 # ===== STEP 3: Google search for additional info =====
-                if self.deep_search and data.name:
-                    google_data = self._search_google_for_business(page, data.name, location)
+                needs_google_lookup = (
+                    self.deep_search
+                    and data.name
+                    and (
+                        not data.instagram
+                        or not data.facebook
+                        or not data.whatsapp_numbers
+                        or not data.emails
+                    )
+                )
+                if needs_google_lookup:
+                    google_key = f"{data.name.strip().lower()}|{location.strip().lower()}"
+                    if google_key not in self._google_cache:
+                        self._google_cache[google_key] = self._search_google_for_business(page, data.name, location)
+                    google_data = self._google_cache.get(google_key)
                     if google_data:
                         data.data_sources.append("google_search")
                         
@@ -1167,6 +1202,16 @@ class DeepBusinessScraper:
                 continue
 
         return combined_data
+
+    def _website_cache_key(self, website_url: str) -> str:
+        if not website_url:
+            return ""
+        normalized = website_url if website_url.startswith(("http://", "https://")) else f"https://{website_url}"
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or parsed.path).lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
 
     def _search_google_for_business(self, page: Page, business_name: str, location: str) -> Optional[Dict]:
         """

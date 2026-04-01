@@ -123,6 +123,7 @@ def status() -> Dict:
             "status": SCRAPE_STATE["status"],
             "message": SCRAPE_STATE["message"],
             "count": len(SCRAPE_STATE["results"]),
+            "results": SCRAPE_STATE["results"],
         }
     )
 
@@ -133,7 +134,14 @@ def stop_scrape() -> Dict:
         STOP_EVENT.set()
         SCRAPE_STATE["status"] = "stopping"
         SCRAPE_STATE["message"] = "Stop requested. Finishing current step..."
-        return jsonify({"ok": True, "message": "Stop signal sent"})
+        return jsonify(
+            {
+                "ok": True,
+                "message": "Stop signal sent",
+                "count": len(SCRAPE_STATE["results"]),
+                "results": SCRAPE_STATE["results"],
+            }
+        )
     return jsonify({"ok": False, "message": "No active scrape job"}), 400
 
 
@@ -272,7 +280,29 @@ def scrape() -> Dict:
     SCRAPE_STATE["status"] = "running"
     SCRAPE_STATE["message"] = f"🔍 {mode_desc} scraping for '{keyword}' in '{location}'"
     SCRAPE_STATE["results"] = []
+    SCRAPE_STATE["csv_path"] = ""
     STOP_EVENT.clear()
+
+    partial_results: List[Dict[str, str]] = []
+
+    def report_progress(lead: Dict[str, str]) -> None:
+        if not isinstance(lead, dict):
+            return
+
+        lead_copy = dict(lead)
+        if exclusion_business_ids and scrape_history:
+            business_id = scrape_history.get_business_id(lead_copy)
+            if business_id and business_id in exclusion_business_ids:
+                return
+
+        lead_copy["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead_copy)
+        partial_results.append(lead_copy)
+        SCRAPE_STATE["results"] = partial_results.copy()
+
+        if STOP_EVENT.is_set():
+            SCRAPE_STATE["message"] = f"Stopping... {len(partial_results)} leads collected so far"
+        else:
+            SCRAPE_STATE["message"] = f"Running... {len(partial_results)} leads collected"
 
     try:
         # Choose scraper based on extraction mode
@@ -289,6 +319,7 @@ def scrape() -> Dict:
                     verify_socials=verify_socials,
                     skip_duplicates=skip_duplicates,
                     logger=log,
+                    progress_callback=report_progress,
                 )
             else:
                 log.warning("UltraDeepScraper not available, falling back to Deep")
@@ -305,6 +336,7 @@ def scrape() -> Dict:
                     deep_search=deep_search,
                     skip_duplicates=skip_duplicates,
                     logger=log,
+                    progress_callback=report_progress,
                 )
             else:
                 log.warning("DeepBusinessScraper not available, falling back to Enhanced")
@@ -319,6 +351,7 @@ def scrape() -> Dict:
                     headless=headless,
                     website_filter=website_filter,
                     logger=log,
+                    progress_callback=report_progress,
                 )
             else:
                 log.warning("EnhancedScraper not available, falling back to Basic")
@@ -333,6 +366,7 @@ def scrape() -> Dict:
                     headless=headless,
                     website_filter=website_filter,
                     logger=log,
+                    progress_callback=report_progress,
                 )
             else:
                 return jsonify({"error": "No scraper available"}), 500
@@ -370,7 +404,7 @@ def scrape() -> Dict:
 
         if STOP_EVENT.is_set():
             SCRAPE_STATE["status"] = "stopped"
-            SCRAPE_STATE["message"] = "Scrape stopped by user"
+            SCRAPE_STATE["message"] = f"Scrape stopped. {len(results)} leads collected"
         else:
             SCRAPE_STATE["status"] = "completed"
             if excluded_by_history > 0:
@@ -414,8 +448,8 @@ def download_csv():
 def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
     safe_keyword = _sanitize_token(keyword)
     safe_location = _sanitize_token(location)
-    filename = f"leads_{safe_keyword}_{safe_location}.csv"
-    path = os.path.join(OUTPUT_DIR, filename)
+    base_filename = f"leads_{safe_keyword}_{safe_location}"
+    path = _build_unique_output_path(base_filename)
     
     log.info("Writing CSV to: %s", path)
     log.info("Number of leads to write: %d", len(leads))
@@ -477,6 +511,27 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
         raise
 
     return path
+
+
+def _build_unique_output_path(base_filename: str) -> str:
+    filename = os.path.basename((base_filename or "").strip())
+    stem, ext = os.path.splitext(filename)
+
+    if not stem:
+        stem = datetime.now().strftime("%Y%m%d%H%M%S")
+    if ext.lower() != ".csv":
+        ext = ".csv"
+
+    candidate = os.path.join(OUTPUT_DIR, f"{stem}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+
+    suffix = 1
+    while True:
+        candidate = os.path.join(OUTPUT_DIR, f"{stem}_{suffix}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        suffix += 1
 
 
 def _list_output_history_files() -> List[Dict[str, str]]:

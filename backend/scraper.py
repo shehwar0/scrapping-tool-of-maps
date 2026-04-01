@@ -3,8 +3,8 @@ import random
 import re
 import time
 from threading import Event
-from typing import Dict, List, Optional, Set
-from urllib.parse import quote_plus
+from typing import Callable, Dict, List, Optional, Set
+from urllib.parse import quote_plus, urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -29,6 +29,7 @@ class GoogleMapsScraper:
         max_delay: float = 1.6,
         website_filter: str = "all",
         logger: Optional[logging.Logger] = None,
+        progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
         self.max_results = max(1, min(max_results, MAX_RESULTS_CAP))
         self.headless = headless
@@ -37,6 +38,8 @@ class GoogleMapsScraper:
         self.website_filter = website_filter if website_filter in {"all", "with", "without"} else "all"
         self.log = logger or logging.getLogger(__name__)
         self.website_extractor = WebsiteExtractor()
+        self.progress_callback = progress_callback
+        self._enrichment_cache: Dict[str, Dict[str, str]] = {}
 
     def scrape(
         self,
@@ -146,7 +149,7 @@ class GoogleMapsScraper:
         seen: Set[str] = set()
         stagnant_rounds = 0
         max_stagnant_rounds = 14 if self.max_results > 100 else 8
-        scroll_delay_min, scroll_delay_max = (0.45, 0.9) if self.max_results > 100 else (self.min_delay, self.max_delay)
+        scroll_delay_min, scroll_delay_max = (0.25, 0.5) if self.max_results > 100 else (0.3, 0.6)
 
         if "/maps/place/" in (page.url or ""):
             return [page.url]
@@ -225,7 +228,13 @@ class GoogleMapsScraper:
                 continue
 
             leads.append(lead)
-            self._human_delay()
+            if self.progress_callback:
+                try:
+                    self.progress_callback(dict(lead))
+                except Exception:
+                    # Progress callbacks should never interrupt scraping.
+                    pass
+            self._human_delay(0.2, 0.45)
 
         return leads
 
@@ -248,10 +257,17 @@ class GoogleMapsScraper:
                 phone = self._extract_phone(page)
                 website = self._extract_website(page)
 
-                enrichment = self.website_extractor.enrich(website, fallback_phone=phone) if website else {
-                    "email": "",
-                    "whatsapp": self.website_extractor._normalize_phone(phone),
-                }
+                if website:
+                    cache_key = self._website_cache_key(website)
+                    enrichment = self._enrichment_cache.get(cache_key)
+                    if enrichment is None:
+                        enrichment = self.website_extractor.enrich(website, fallback_phone=phone)
+                        self._enrichment_cache[cache_key] = dict(enrichment)
+                else:
+                    enrichment = {
+                        "email": "",
+                        "whatsapp": self.website_extractor._normalize_phone(phone),
+                    }
 
                 return {
                     "name": name,
@@ -291,6 +307,16 @@ class GoogleMapsScraper:
                 pass
 
         return ""
+
+    def _website_cache_key(self, website_url: str) -> str:
+        if not website_url:
+            return ""
+        normalized = website_url if website_url.startswith(("http://", "https://")) else f"https://{website_url}"
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or parsed.path).lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
 
     def _extract_phone(self, page) -> str:
         selectors = [
