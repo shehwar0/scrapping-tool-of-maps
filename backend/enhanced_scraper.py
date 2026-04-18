@@ -17,10 +17,16 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from business_extractor import BusinessData, analyze_website
+from maps_city_coverage import build_citywide_queries
+from url_filters import is_business_website, normalize_business_website
 
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s()\-]{6,}\d)")
 MAX_RESULTS_CAP = 500
-RESULT_SCAN_WINDOW = 140
+RESULT_SCAN_WINDOW = 260
+CITYWIDE_QUERY_LIMIT = 7
+MAP_STAGNANT_ROUNDS = 16
+MAP_SCROLL_DELAY_MIN = 0.28
+MAP_SCROLL_DELAY_MAX = 0.55
 
 # Pages to check for contact info (in order of priority)
 CONTACT_PAGES = ["", "/contact", "/contact-us", "/about", "/about-us", "/team"]
@@ -61,8 +67,11 @@ class EnhancedGoogleMapsScraper:
         stop_event: Optional[Event] = None,
     ) -> List[Dict[str, str]]:
         """Main scrape method - async for better performance."""
-        query = f"{keyword} in {location}".strip()
         stop_event = stop_event or Event()
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
+
+        if not search_queries:
+            return []
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
@@ -77,9 +86,42 @@ class EnhancedGoogleMapsScraper:
             page = await context.new_page()
             
             try:
-                await self._open_and_search(page, query)
-                place_urls = await self._collect_place_urls(page, stop_event)
-                leads = await self._collect_lead_details(context, place_urls, stop_event)
+                if len(search_queries) > 1:
+                    self.log.info("Using %d map zones for broader city coverage", len(search_queries))
+
+                discovered: List[str] = []
+                seen: Set[str] = set()
+                target_urls = self.max_results
+                per_query_target = max(8, (target_urls + len(search_queries) - 1) // len(search_queries))
+
+                for query in search_queries:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
+                        break
+
+                    remaining = target_urls - len(discovered)
+                    query_target = min(per_query_target, remaining)
+                    await self._open_and_search(page, query)
+                    place_urls = await self._collect_place_urls(page, stop_event, target_count=query_target)
+
+                    for place_url in place_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                if len(discovered) < target_urls and not stop_event.is_set():
+                    remaining = target_urls - len(discovered)
+                    await self._open_and_search(page, search_queries[0])
+                    fallback_urls = await self._collect_place_urls(page, stop_event, target_count=remaining)
+                    for place_url in fallback_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                leads = await self._collect_lead_details(context, discovered[:target_urls], stop_event)
                 return [lead.to_dict() for lead in leads]
             finally:
                 await context.close()
@@ -184,19 +226,19 @@ class EnhancedGoogleMapsScraper:
             except Exception:
                 continue
     
-    async def _collect_place_urls(self, page: Page, stop_event: Event) -> List[str]:
+    async def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
         """Collect all place URLs from search results."""
         discovered: List[str] = []
         seen: Set[str] = set()
         stagnant_rounds = 0
-        max_stagnant_rounds = 14 if self.max_results > 100 else 8
-        scroll_delay_min, scroll_delay_max = (0.25, 0.5) if self.max_results > 100 else (0.3, 0.6)
+        max_stagnant_rounds = MAP_STAGNANT_ROUNDS
+        target_urls = max(1, target_count or self.max_results)
         
         current_url = page.url or ""
         if "/maps/place/" in current_url:
-            return [current_url]
+            return [current_url][:target_urls]
         
-        while len(discovered) < self.max_results and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
+        while len(discovered) < target_urls and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
             before = len(discovered)
             hrefs: List[str] = []
             
@@ -211,7 +253,7 @@ class EnhancedGoogleMapsScraper:
             if hrefs:
                 tail_start = max(0, len(hrefs) - RESULT_SCAN_WINDOW)
                 for href in hrefs[tail_start:]:
-                    if stop_event.is_set() or len(discovered) >= self.max_results:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
                         break
                     if href and href not in seen:
                         seen.add(href)
@@ -222,7 +264,7 @@ class EnhancedGoogleMapsScraper:
                 start_idx = max(0, count - RESULT_SCAN_WINDOW)
                 
                 for idx in range(start_idx, count):
-                    if stop_event.is_set() or len(discovered) >= self.max_results:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
                         break
                     href = ""
                     for _ in range(2):
@@ -246,11 +288,11 @@ class EnhancedGoogleMapsScraper:
             except Exception:
                 await page.mouse.wheel(0, 4000)
             
-            await self._human_delay(scroll_delay_min, scroll_delay_max)
+            await self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
             await self._raise_if_captcha(page)
         
         self.log.info("Discovered %s place urls", len(discovered))
-        return discovered[: self.max_results]
+        return discovered[:target_urls]
     
     async def _collect_lead_details(
         self, 
@@ -291,7 +333,7 @@ class EnhancedGoogleMapsScraper:
     
     def _passes_website_filter(self, website: str) -> bool:
         """Check if listing passes website filter."""
-        has_website = bool((website or "").strip())
+        has_website = is_business_website(website)
         if self.website_filter == "with":
             return has_website
         if self.website_filter == "without":
@@ -453,7 +495,7 @@ class EnhancedGoogleMapsScraper:
                     continue
                 href = await anchor.get_attribute("href") or ""
                 if href and href.startswith("http"):
-                    return href
+                    return normalize_business_website(href)
             except Exception:
                 continue
         

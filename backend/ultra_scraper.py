@@ -62,6 +62,8 @@ from deep_scraper import (
     CONTACT_PAGES,
     CaptchaDetectedError,
 )
+from maps_city_coverage import build_citywide_queries
+from url_filters import is_business_website, normalize_business_website
 
 # Import history manager for deduplication
 from scrape_history import get_history, ScrapeHistory
@@ -83,7 +85,11 @@ except Exception:  # pragma: no cover
 # ============================================================================
 
 MAX_RESULTS_CAP = 500
-RESULT_SCAN_WINDOW = 300  # Increased to scroll much deeper for new results
+RESULT_SCAN_WINDOW = 260
+CITYWIDE_QUERY_LIMIT = 7
+MAP_STAGNANT_ROUNDS = 16
+MAP_SCROLL_DELAY_MIN = 0.28
+MAP_SCROLL_DELAY_MAX = 0.55
 REQUEST_TIMEOUT = 15
 PARALLEL_WORKERS = 3
 
@@ -478,8 +484,8 @@ class UltraDeepScraper:
         self,
         max_results: int = 50,
         headless: bool = False,
-        min_delay: float = 0.8,
-        max_delay: float = 1.8,
+        min_delay: float = 0.7,
+        max_delay: float = 1.6,
         website_filter: str = "all",
         parallel_engines: bool = True,
         verify_socials: bool = True,
@@ -555,8 +561,16 @@ class UltraDeepScraper:
         stop_event: Optional[Event] = None,
     ) -> List[Dict[str, str]]:
         """Main scrape method with ultra deep extraction and deduplication."""
-        query = f"{keyword} in {location}".strip()
         stop_event = stop_event or Event()
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
+
+        if not search_queries:
+            return []
+
+        duplicate_buffer = 0
+        if self.skip_duplicates:
+            duplicate_buffer = min(12, max(2, self.max_results // 12))
+        target_urls = self.max_results + duplicate_buffer
         
         # Log history stats
         if self.skip_duplicates:
@@ -576,10 +590,42 @@ class UltraDeepScraper:
             
             try:
                 page = context.new_page()
-                
-                self._open_and_search(page, query)
-                place_urls = self._collect_place_urls(page, stop_event, keyword, location)
-                leads = self._ultra_extract_leads(context, place_urls, keyword, location, stop_event)
+
+                if len(search_queries) > 1:
+                    self.log.info("Using %d map zones for broader city coverage", len(search_queries))
+
+                discovered: List[str] = []
+                seen: Set[str] = set()
+                per_query_target = max(10, (target_urls + len(search_queries) - 1) // len(search_queries))
+
+                for query in search_queries:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
+                        break
+
+                    remaining = target_urls - len(discovered)
+                    query_target = min(per_query_target, remaining)
+                    self._open_and_search(page, query)
+                    place_urls = self._collect_place_urls(page, stop_event, target_count=query_target)
+
+                    for place_url in place_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                if len(discovered) < target_urls and not stop_event.is_set():
+                    remaining = target_urls - len(discovered)
+                    self._open_and_search(page, search_queries[0])
+                    fallback_urls = self._collect_place_urls(page, stop_event, target_count=remaining)
+                    for place_url in fallback_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                leads = self._ultra_extract_leads(context, discovered[:target_urls], keyword, location, stop_event)
                 
                 # Convert to dicts and save to history
                 results = [lead.to_dict() for lead in leads]
@@ -666,20 +712,20 @@ class UltraDeepScraper:
             except Exception:
                 continue
 
-    def _collect_place_urls(self, page: Page, stop_event: Event, keyword: str = "", location: str = "") -> List[str]:
+    def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
         """Collect place URLs from Maps, filtering out previously scraped businesses."""
         discovered: List[str] = []
         seen: Set[str] = set()
-        skipped_duplicates = 0
         stagnant_rounds = 0
-        # Increase max stagnant rounds to scroll deeper when looking for new results
-        max_stagnant_rounds = 20 if self.skip_duplicates else (14 if self.max_results > 100 else 8)
+        max_stagnant_rounds = MAP_STAGNANT_ROUNDS + (4 if self.skip_duplicates else 0)
         
-        # Keep a small duplicate buffer without multiplying runtime.
-        duplicate_buffer = 0
-        if self.skip_duplicates:
-            duplicate_buffer = min(12, max(2, self.max_results // 12))
-        target_urls = self.max_results + duplicate_buffer
+        if target_count is None:
+            duplicate_buffer = 0
+            if self.skip_duplicates:
+                duplicate_buffer = min(12, max(2, self.max_results // 12))
+            target_urls = self.max_results + duplicate_buffer
+        else:
+            target_urls = max(1, target_count)
 
         current_url = page.url or ""
         if "/maps/place/" in current_url:
@@ -716,7 +762,7 @@ class UltraDeepScraper:
             except Exception:
                 page.mouse.wheel(0, 4000)
 
-            self._human_delay(0.3, 0.6)
+            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
             self._raise_if_captcha(page)
 
         self.log.info("📍 Discovered %d place URLs total (target %d)", len(discovered), self.max_results)
@@ -1129,7 +1175,7 @@ class UltraDeepScraper:
 
     def _passes_website_filter(self, website: str) -> bool:
         """Check website filter."""
-        has_website = bool((website or "").strip())
+        has_website = is_business_website(website)
         if self.website_filter == "with":
             return has_website
         if self.website_filter == "without":
@@ -1184,7 +1230,7 @@ class UltraDeepScraper:
                 if anchor.count() > 0:
                     href = anchor.get_attribute("href") or ""
                     if href.startswith("http"):
-                        return href
+                        return normalize_business_website(href)
             except Exception:
                 continue
         return ""

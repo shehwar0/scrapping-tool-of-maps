@@ -24,6 +24,8 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from email_extractor import WebsiteExtractor
+from maps_city_coverage import build_citywide_queries
+from url_filters import is_business_website, normalize_business_website
 
 
 # ============================================================================
@@ -31,7 +33,11 @@ from email_extractor import WebsiteExtractor
 # ============================================================================
 
 MAX_RESULTS_CAP = 500
-RESULT_SCAN_WINDOW = 300  # Increased to scroll deeper for new results
+RESULT_SCAN_WINDOW = 260
+CITYWIDE_QUERY_LIMIT = 7
+MAP_STAGNANT_ROUNDS = 16
+MAP_SCROLL_DELAY_MIN = 0.28
+MAP_SCROLL_DELAY_MAX = 0.55
 REQUEST_TIMEOUT = 15
 
 # Pages to check for contact info on websites
@@ -474,8 +480,8 @@ class DeepBusinessScraper:
         self,
         max_results: int = 50,
         headless: bool = False,
-        min_delay: float = 0.8,
-        max_delay: float = 1.8,
+        min_delay: float = 0.7,
+        max_delay: float = 1.6,
         website_filter: str = "all",
         deep_search: bool = True,
         skip_duplicates: bool = True,  # NEW: Skip previously scraped businesses
@@ -519,8 +525,16 @@ class DeepBusinessScraper:
         stop_event: Optional[Event] = None,
     ) -> List[Dict[str, str]]:
         """Main scrape method with deduplication."""
-        query = f"{keyword} in {location}".strip()
         stop_event = stop_event or Event()
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
+
+        if not search_queries:
+            return []
+
+        duplicate_buffer = 0
+        if self.skip_duplicates:
+            duplicate_buffer = min(12, max(2, self.max_results // 12))
+        target_urls = self.max_results + duplicate_buffer
         
         # Log history stats
         if self.skip_duplicates and self.history:
@@ -541,10 +555,42 @@ class DeepBusinessScraper:
             try:
                 # Main page for Maps navigation
                 page = context.new_page()
-                
-                self._open_and_search(page, query)
-                place_urls = self._collect_place_urls(page, stop_event)
-                leads = self._collect_lead_details(context, place_urls, keyword, location, stop_event)
+
+                if len(search_queries) > 1:
+                    self.log.info("Using %d map zones for broader city coverage", len(search_queries))
+
+                discovered: List[str] = []
+                seen: Set[str] = set()
+                per_query_target = max(10, (target_urls + len(search_queries) - 1) // len(search_queries))
+
+                for query in search_queries:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
+                        break
+
+                    remaining = target_urls - len(discovered)
+                    query_target = min(per_query_target, remaining)
+                    self._open_and_search(page, query)
+                    place_urls = self._collect_place_urls(page, stop_event, target_count=query_target)
+
+                    for place_url in place_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                if len(discovered) < target_urls and not stop_event.is_set():
+                    remaining = target_urls - len(discovered)
+                    self._open_and_search(page, search_queries[0])
+                    fallback_urls = self._collect_place_urls(page, stop_event, target_count=remaining)
+                    for place_url in fallback_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                leads = self._collect_lead_details(context, discovered[:target_urls], keyword, location, stop_event)
                 
                 # Convert to dicts
                 results = [lead.to_dict() for lead in leads]
@@ -634,19 +680,20 @@ class DeepBusinessScraper:
             except Exception:
                 continue
 
-    def _collect_place_urls(self, page: Page, stop_event: Event) -> List[str]:
+    def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
         """Collect place URLs from Maps results - scrolls deeper when deduplication is enabled."""
         discovered: List[str] = []
         seen: Set[str] = set()
         stagnant_rounds = 0
-        # Increase stagnant rounds when looking for new results
-        max_stagnant_rounds = 20 if self.skip_duplicates else (14 if self.max_results > 100 else 8)
+        max_stagnant_rounds = MAP_STAGNANT_ROUNDS + (4 if self.skip_duplicates else 0)
         
-        # Keep a small buffer for duplicates without tripling work and runtime.
-        duplicate_buffer = 0
-        if self.skip_duplicates:
-            duplicate_buffer = min(12, max(2, self.max_results // 12))
-        target_urls = self.max_results + duplicate_buffer
+        if target_count is None:
+            duplicate_buffer = 0
+            if self.skip_duplicates:
+                duplicate_buffer = min(12, max(2, self.max_results // 12))
+            target_urls = self.max_results + duplicate_buffer
+        else:
+            target_urls = max(1, target_count)
 
         current_url = page.url or ""
         if "/maps/place/" in current_url:
@@ -699,7 +746,7 @@ class DeepBusinessScraper:
             except Exception:
                 page.mouse.wheel(0, 4000)
 
-            self._human_delay(0.3, 0.6)
+            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
             self._raise_if_captcha(page)
 
         self.log.info("📍 Discovered %d place URLs (target %d)", len(discovered), self.max_results)
@@ -772,7 +819,7 @@ class DeepBusinessScraper:
 
     def _passes_website_filter(self, website: str) -> bool:
         """Check if listing passes website filter."""
-        has_website = bool((website or "").strip())
+        has_website = is_business_website(website)
         if self.website_filter == "with":
             return has_website
         if self.website_filter == "without":
@@ -953,7 +1000,7 @@ class DeepBusinessScraper:
                     continue
                 href = anchor.get_attribute("href") or ""
                 if href and href.startswith("http"):
-                    return href
+                    return normalize_business_website(href)
             except Exception:
                 continue
 

@@ -10,10 +10,16 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from email_extractor import WebsiteExtractor
+from maps_city_coverage import build_citywide_queries
+from url_filters import is_business_website, normalize_business_website
 
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s()\-]{6,}\d)")
 MAX_RESULTS_CAP = 500
-RESULT_SCAN_WINDOW = 140
+RESULT_SCAN_WINDOW = 260
+CITYWIDE_QUERY_LIMIT = 7
+MAP_STAGNANT_ROUNDS = 16
+MAP_SCROLL_DELAY_MIN = 0.28
+MAP_SCROLL_DELAY_MAX = 0.55
 
 
 class CaptchaDetectedError(RuntimeError):
@@ -47,8 +53,11 @@ class GoogleMapsScraper:
         location: str,
         stop_event: Optional[Event] = None,
     ) -> List[Dict[str, str]]:
-        query = f"{keyword} in {location}".strip()
         stop_event = stop_event or Event()
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
+
+        if not search_queries:
+            return []
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=self.headless)
@@ -63,9 +72,42 @@ class GoogleMapsScraper:
             page = context.new_page()
 
             try:
-                self._open_and_search(page, query)
-                place_urls = self._collect_place_urls(page, stop_event)
-                leads = self._collect_lead_details(page, place_urls, stop_event)
+                if len(search_queries) > 1:
+                    self.log.info("Using %d map zones for broader city coverage", len(search_queries))
+
+                discovered: List[str] = []
+                seen: Set[str] = set()
+                target_urls = self.max_results
+                per_query_target = max(8, (target_urls + len(search_queries) - 1) // len(search_queries))
+
+                for query in search_queries:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
+                        break
+
+                    remaining = target_urls - len(discovered)
+                    query_target = min(per_query_target, remaining)
+                    self._open_and_search(page, query)
+                    place_urls = self._collect_place_urls(page, stop_event, target_count=query_target)
+
+                    for place_url in place_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                if len(discovered) < target_urls and not stop_event.is_set():
+                    remaining = target_urls - len(discovered)
+                    self._open_and_search(page, search_queries[0])
+                    fallback_urls = self._collect_place_urls(page, stop_event, target_count=remaining)
+                    for place_url in fallback_urls:
+                        if place_url and place_url not in seen:
+                            seen.add(place_url)
+                            discovered.append(place_url)
+                            if len(discovered) >= target_urls:
+                                break
+
+                leads = self._collect_lead_details(page, discovered[:target_urls], stop_event)
                 return leads
             finally:
                 context.close()
@@ -144,17 +186,17 @@ class GoogleMapsScraper:
             except Exception:
                 continue
 
-    def _collect_place_urls(self, page, stop_event: Event) -> List[str]:
+    def _collect_place_urls(self, page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
         discovered: List[str] = []
         seen: Set[str] = set()
         stagnant_rounds = 0
-        max_stagnant_rounds = 14 if self.max_results > 100 else 8
-        scroll_delay_min, scroll_delay_max = (0.25, 0.5) if self.max_results > 100 else (0.3, 0.6)
+        max_stagnant_rounds = MAP_STAGNANT_ROUNDS
+        target_urls = max(1, target_count or self.max_results)
 
         if "/maps/place/" in (page.url or ""):
-            return [page.url]
+            return [page.url][:target_urls]
 
-        while len(discovered) < self.max_results and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
+        while len(discovered) < target_urls and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
             before = len(discovered)
             hrefs: List[str] = []
 
@@ -170,7 +212,7 @@ class GoogleMapsScraper:
                 # New URLs usually appear near the tail of the results feed; scanning a window keeps this loop fast.
                 tail_start = max(0, len(hrefs) - RESULT_SCAN_WINDOW)
                 for href in hrefs[tail_start:]:
-                    if stop_event.is_set() or len(discovered) >= self.max_results:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
                         break
                     if href and href not in seen:
                         seen.add(href)
@@ -181,7 +223,7 @@ class GoogleMapsScraper:
                 start_idx = max(0, count - RESULT_SCAN_WINDOW)
 
                 for idx in range(start_idx, count):
-                    if stop_event.is_set() or len(discovered) >= self.max_results:
+                    if stop_event.is_set() or len(discovered) >= target_urls:
                         break
                     href = ""
                     for _ in range(2):
@@ -205,11 +247,11 @@ class GoogleMapsScraper:
             except Exception:
                 page.mouse.wheel(0, 4000)
 
-            self._human_delay(scroll_delay_min, scroll_delay_max)
+            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
             self._raise_if_captcha(page)
 
         self.log.info("Discovered %s place urls", len(discovered))
-        return discovered[: self.max_results]
+        return discovered[:target_urls]
 
     def _collect_lead_details(self, page, place_urls: List[str], stop_event: Event) -> List[Dict[str, str]]:
         leads: List[Dict[str, str]] = []
@@ -239,7 +281,7 @@ class GoogleMapsScraper:
         return leads
 
     def _passes_website_filter(self, website: str) -> bool:
-        has_website = bool((website or "").strip())
+        has_website = is_business_website(website)
         if self.website_filter == "with":
             return has_website
         if self.website_filter == "without":
@@ -276,7 +318,7 @@ class GoogleMapsScraper:
                     "website": website,
                     "whatsapp": enrichment.get("whatsapp", ""),
                     "google_maps_url": place_url,
-                    "has_website": "Yes" if bool((website or "").strip()) else "No",
+                    "has_website": "Yes" if is_business_website(website) else "No",
                 }
             except CaptchaDetectedError:
                 raise
@@ -364,7 +406,7 @@ class GoogleMapsScraper:
                     continue
                 href = anchor.get_attribute("href") or ""
                 if href and href.startswith("http"):
-                    return href
+                    return normalize_business_website(href)
             except Exception:
                 continue
 
