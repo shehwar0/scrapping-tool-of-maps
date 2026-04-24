@@ -13,6 +13,7 @@ const historyFilesList = document.getElementById("historyFilesList");
 const refreshHistoryFilesBtn = document.getElementById("refreshHistoryFilesBtn");
 const selectAllHistoryFilesBtn = document.getElementById("selectAllHistoryFilesBtn");
 const clearSelectedHistoryFilesBtn = document.getElementById("clearSelectedHistoryFilesBtn");
+const locationSuggestions = document.getElementById("locationSuggestions");
 const MAX_RESULTS_LIMIT = 500;
 
 let pollingId = null;
@@ -229,6 +230,101 @@ if (clearSelectedHistoryFilesBtn) {
 const keywordInput = document.getElementById("keyword");
 const locationInput = document.getElementById("location");
 
+function normalizeLocationText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9,\s-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildLocationFormatSuggestions(rawValue) {
+  const cleaned = String(rawValue || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return [];
+  }
+
+  if (cleaned.includes(",")) {
+    return [];
+  }
+
+  return [
+    `${cleaned}, State/Region, Country`,
+    `${cleaned}, Country`,
+    `${cleaned} metro area, Country`,
+  ];
+}
+
+function hideLocationSuggestions() {
+  if (!locationSuggestions) {
+    return;
+  }
+  locationSuggestions.innerHTML = "";
+  locationSuggestions.style.display = "none";
+}
+
+function showLocationSuggestions(inputValue, options) {
+  if (!locationSuggestions || !locationInput || !Array.isArray(options) || options.length === 0) {
+    hideLocationSuggestions();
+    return;
+  }
+
+  locationSuggestions.innerHTML = "";
+
+  const title = document.createElement("small");
+  title.className = "location-suggestions-title";
+  title.textContent = `Improve global matching for "${inputValue}" by choosing a structured location:`;
+
+  const list = document.createElement("div");
+  list.className = "location-suggestions-list";
+
+  options.forEach((option) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "location-suggestion-btn";
+    btn.textContent = option;
+    btn.addEventListener("click", () => {
+      locationInput.value = option;
+      hideLocationSuggestions();
+      locationInput.dispatchEvent(new Event("input", { bubbles: true }));
+      setStatus(`Location format applied: ${option}`);
+    });
+    list.appendChild(btn);
+  });
+
+  locationSuggestions.appendChild(title);
+  locationSuggestions.appendChild(list);
+  locationSuggestions.style.display = "block";
+}
+
+function updateLocationDisambiguation() {
+  if (!locationInput) {
+    return;
+  }
+
+  const raw = locationInput.value.trim();
+  if (!raw) {
+    hideLocationSuggestions();
+    return;
+  }
+
+  const suggestions = buildLocationFormatSuggestions(raw);
+
+  if (!suggestions || suggestions.length === 0) {
+    hideLocationSuggestions();
+    return;
+  }
+
+  const normalizedRaw = normalizeLocationText(raw);
+  const alreadySelected = suggestions.some((item) => normalizeLocationText(item) === normalizedRaw);
+  if (alreadySelected) {
+    hideLocationSuggestions();
+    return;
+  }
+
+  showLocationSuggestions(raw, suggestions);
+}
+
 if (keywordInput && locationInput) {
   let historyTimeout;
   const checkHistory = () => {
@@ -237,8 +333,28 @@ if (keywordInput && locationInput) {
   };
   
   keywordInput.addEventListener("input", checkHistory);
-  locationInput.addEventListener("input", checkHistory);
+  locationInput.addEventListener("input", () => {
+    checkHistory();
+    updateLocationDisambiguation();
+  });
+  locationInput.addEventListener("focus", updateLocationDisambiguation);
+  locationInput.addEventListener("blur", () => {
+    setTimeout(hideLocationSuggestions, 150);
+  });
 }
+
+document.addEventListener("click", (event) => {
+  if (!locationSuggestions || !locationInput) {
+    return;
+  }
+
+  const target = event.target;
+  if (locationSuggestions.contains(target) || locationInput.contains(target)) {
+    return;
+  }
+
+  hideLocationSuggestions();
+});
 
 function setStatus(message) {
   statusEl.textContent = message;

@@ -22,7 +22,9 @@
         </label>
         <label>
           Location
-          <input id="location" type="text" placeholder="Islamabad, Lahore, Karachi..." />
+          <input id="location" type="text" placeholder="City/Town, State/Region, Country" />
+          <small class="location-hint">Tip: City, State/Region, Country format improves global accuracy.</small>
+          <div id="locationSuggestions" class="location-suggestions" aria-live="polite"></div>
         </label>
         <label>
           Max Results (1-500)

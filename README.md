@@ -52,12 +52,13 @@ python -m playwright install chromium
 4. Run backend:
 
 ```bash
+$env:APP_PORT=5001
 python backend/app.py
 ```
 
 5. Open in browser:
 
-- http://127.0.0.1:5000
+- http://127.0.0.1:5001
 
 ## API Endpoints
 
@@ -74,5 +75,6 @@ python backend/app.py
 ## Notes
 
 - This project is intended for local use only.
+- For global coverage, use location in `City/Town, State/Region, Country` format when possible.
 - Google Maps UI changes can break selectors; update selectors in `backend/scraper.py` when needed.
-- If Google shows anti-bot challenge/CAPTCHA, scraper stops and returns an error.
+- If Google shows anti-bot challenge/CAPTCHA, scraper may stop and return partial/failed results. This tool does not bypass anti-bot protections.

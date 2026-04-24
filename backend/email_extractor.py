@@ -129,6 +129,9 @@ class WebsiteExtractor:
         self._html_cache: Dict[str, str] = {}
         self._cache_fifo: List[str] = []
         self._max_cache_entries = 64
+        self._host_denials: Dict[str, int] = {}
+        self._blocked_hosts: Set[str] = set()
+        self._host_block_threshold = 3
 
     def enrich(self, website_url: str, fallback_phone: str = "") -> Dict[str, str]:
         """Return {email, whatsapp} by crawling a small set of internal pages."""
@@ -279,6 +282,10 @@ class WebsiteExtractor:
         if url in self._html_cache:
             return self._html_cache[url]
 
+        host = self._get_host(url)
+        if host in self._blocked_hosts:
+            return ""
+
         # httpx first (faster, HTTP/2), then requests fallback
         text = ""
         try:
@@ -288,10 +295,15 @@ class WebsiteExtractor:
                 if max_bytes and len(content) > max_bytes:
                     content = content[:max_bytes]
                 text = content.decode(r.encoding or "utf-8", errors="ignore")
+                self._clear_host_denials(url)
+            else:
+                self._register_host_denial(url, r.status_code)
         except Exception:
             text = ""
 
         if not text:
+            if host in self._blocked_hosts:
+                return ""
             try:
                 r2 = self._requests_session.get(url, timeout=self.timeout, verify=False, allow_redirects=True)
                 if r2.status_code < 400:
@@ -299,12 +311,41 @@ class WebsiteExtractor:
                     if max_bytes and len(raw) > max_bytes:
                         raw = raw[:max_bytes]
                     text = raw.decode(r2.encoding or "utf-8", errors="ignore")
+                    self._clear_host_denials(url)
+                else:
+                    self._register_host_denial(url, r2.status_code)
             except requests.RequestException:
                 text = ""
 
         if text:
             self._cache_put(url, text)
         return text
+
+    def _get_host(self, url: str) -> str:
+        try:
+            return (urlparse(url).netloc or "").lower()
+        except Exception:
+            return ""
+
+    def _register_host_denial(self, url: str, status_code: int) -> None:
+        if status_code not in {401, 403, 429}:
+            return
+
+        host = self._get_host(url)
+        if not host:
+            return
+
+        denied_count = self._host_denials.get(host, 0) + 1
+        self._host_denials[host] = denied_count
+        if denied_count >= self._host_block_threshold:
+            self._blocked_hosts.add(host)
+
+    def _clear_host_denials(self, url: str) -> None:
+        host = self._get_host(url)
+        if not host:
+            return
+        self._host_denials.pop(host, None)
+        self._blocked_hosts.discard(host)
 
     def _discover_priority_links(self, html: str, base: str) -> List[str]:
         candidates: List[str] = []

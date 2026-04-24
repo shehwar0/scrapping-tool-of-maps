@@ -22,11 +22,23 @@ from url_filters import is_business_website, normalize_business_website
 
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s()\-]{6,}\d)")
 MAX_RESULTS_CAP = 500
-RESULT_SCAN_WINDOW = 260
-CITYWIDE_QUERY_LIMIT = 7
-MAP_STAGNANT_ROUNDS = 16
+RESULT_SCAN_WINDOW = 320
+CITYWIDE_QUERY_LIMIT = 18
+MAP_STAGNANT_ROUNDS = 22
 MAP_SCROLL_DELAY_MIN = 0.28
 MAP_SCROLL_DELAY_MAX = 0.55
+QUERY_RETRY_ATTEMPTS = 2
+QUERY_RETRY_BASE_WAIT_MS = 2500
+CAPTCHA_MANUAL_WAIT_MS = 90000
+CAPTCHA_POLL_MS = 1500
+CAPTCHA_MARKERS = (
+    "unusual traffic",
+    "detected unusual",
+    "recaptcha",
+    "verify you are human",
+    "not a robot",
+    "g-recaptcha",
+)
 
 # Pages to check for contact info (in order of priority)
 CONTACT_PAGES = ["", "/contact", "/contact-us", "/about", "/about-us", "/team"]
@@ -98,8 +110,7 @@ class GoogleMapsScraper:
 
                     remaining = target_urls - len(discovered)
                     query_target = min(per_query_target, remaining)
-                    self._open_and_search(page, query)
-                    place_urls = self._collect_place_urls(page, stop_event, target_count=query_target)
+                    place_urls = self._search_query_with_retries(page, query, stop_event, query_target)
 
                     for place_url in place_urls:
                         if place_url and place_url not in seen:
@@ -110,8 +121,12 @@ class GoogleMapsScraper:
 
                 if len(discovered) < target_urls and not stop_event.is_set():
                     remaining = target_urls - len(discovered)
-                    self._open_and_search(page, search_queries[0])
-                    fallback_urls = self._collect_place_urls(page, stop_event, target_count=remaining)
+                    fallback_urls = self._search_query_with_retries(
+                        page,
+                        search_queries[0],
+                        stop_event,
+                        remaining,
+                    )
                     for place_url in fallback_urls:
                         if place_url and place_url not in seen:
                             seen.add(place_url)
@@ -124,6 +139,42 @@ class GoogleMapsScraper:
             finally:
                 context.close()
                 browser.close()
+
+    def _search_query_with_retries(self, page: Page, query: str, stop_event: Event, target_count: int) -> List[str]:
+        last_error: Optional[Exception] = None
+
+        for attempt in range(QUERY_RETRY_ATTEMPTS + 1):
+            if stop_event.is_set():
+                break
+
+            try:
+                self._open_and_search(page, query)
+                return self._collect_place_urls(page, stop_event, target_count=target_count)
+            except CaptchaDetectedError as exc:
+                last_error = exc
+                if attempt >= QUERY_RETRY_ATTEMPTS:
+                    break
+
+                cooldown_ms = QUERY_RETRY_BASE_WAIT_MS * (attempt + 1)
+                self.log.warning(
+                    "Captcha challenge for query '%s' (attempt %d/%d). Cooling down for %d ms and retrying.",
+                    query,
+                    attempt + 1,
+                    QUERY_RETRY_ATTEMPTS + 1,
+                    cooldown_ms,
+                )
+                page.wait_for_timeout(cooldown_ms)
+
+                try:
+                    page.goto("https://www.google.com/maps", timeout=45000)
+                    page.wait_for_timeout(1000)
+                    self._maybe_accept_consent(page)
+                except Exception:
+                    pass
+
+        if isinstance(last_error, CaptchaDetectedError):
+            raise last_error
+        raise RuntimeError(f"Search failed for query: {query}")
     
     def _open_and_search(self, page: Page, query: str) -> None:
         """Navigate to Google Maps and search."""
@@ -689,13 +740,29 @@ class GoogleMapsScraper:
     
     def _raise_if_captcha(self, page: Page) -> None:
         """Check for CAPTCHA and raise error if detected."""
+        if not self._is_captcha_present(page):
+            return
+
+        if not self.headless:
+            deadline = time.time() + (CAPTCHA_MANUAL_WAIT_MS / 1000)
+            self.log.warning("Captcha challenge detected. Waiting for manual solve in browser window.")
+
+            while time.time() < deadline:
+                page.wait_for_timeout(CAPTCHA_POLL_MS)
+                if not self._is_captcha_present(page):
+                    self.log.info("Captcha challenge cleared manually. Resuming scrape.")
+                    return
+
+            raise CaptchaDetectedError("Captcha challenge not cleared in time")
+
+        raise CaptchaDetectedError("Captcha or anti-bot challenge detected on Google Maps")
+
+    def _is_captcha_present(self, page: Page) -> bool:
         try:
             content = page.content().lower()
         except Exception:
-            return
-        
-        if "unusual traffic" in content or "detected unusual" in content or "recaptcha" in content:
-            raise CaptchaDetectedError("Captcha or anti-bot challenge detected on Google Maps")
+            return False
+        return any(marker in content for marker in CAPTCHA_MARKERS)
     
     def _human_delay(self, minimum: Optional[float] = None, maximum: Optional[float] = None) -> None:
         """Add human-like delay."""

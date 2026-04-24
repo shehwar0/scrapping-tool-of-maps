@@ -429,6 +429,11 @@ def scrape() -> Dict:
         SCRAPE_STATE["message"] = "Captcha detected. Please try again later."
         return jsonify({"error": SCRAPE_STATE["message"]}), 429
     except Exception as exc:
+        if _looks_like_captcha_error(exc):
+            log.error("Captcha-like challenge detected: %s", exc)
+            SCRAPE_STATE["status"] = "captcha"
+            SCRAPE_STATE["message"] = "Captcha challenge detected. Run in non-headless mode and solve challenge if prompted."
+            return jsonify({"error": SCRAPE_STATE["message"]}), 429
         log.exception("Scrape failed: %s", exc)
         SCRAPE_STATE["status"] = "error"
         SCRAPE_STATE["message"] = f"Scrape failed: {exc}"
@@ -443,6 +448,20 @@ def download_csv():
     if not csv_path or not os.path.exists(csv_path):
         return jsonify({"error": "No CSV file available. Run scraping first."}), 404
     return send_file(csv_path, as_attachment=True)
+
+
+def _looks_like_captcha_error(exc: Exception) -> bool:
+    message = (str(exc) or "").lower()
+    markers = (
+        "captcha",
+        "recaptcha",
+        "unusual traffic",
+        "anti-bot",
+        "verify you are human",
+        "not a robot",
+        "challenge",
+    )
+    return any(marker in message for marker in markers)
 
 
 def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
@@ -637,4 +656,11 @@ def _sanitize_token(value: str) -> str:
 
 if __name__ == "__main__":
     # Disable debug mode to prevent auto-reload during long scraping sessions
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    host = os.getenv("APP_HOST", "127.0.0.1")
+    try:
+        port = int(os.getenv("APP_PORT", "5001"))
+    except ValueError:
+        port = 5001
+
+    log.info("Starting server on http://%s:%s", host, port)
+    app.run(host=host, port=port, debug=False, threaded=True)

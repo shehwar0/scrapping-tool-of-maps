@@ -1,2 +1,1 @@
-cd scrapping-tool-of-maps
-.\.venv\Scripts\python.exe backend\app.py 
+$env:APP_PORT=5001; .\.venv\Scripts\python.exe backend\app.py
