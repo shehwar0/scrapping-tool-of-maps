@@ -39,7 +39,16 @@ GLOBAL_DISCOVERY_MODIFIERS = [
     "nearest",
 ]
 
-RADIUS_HINTS_KM = [3, 5, 8, 12, 20, 30, 45]
+RADIUS_HINTS_KM = [3, 5, 8, 12, 20, 30, 45, 60, 80, 120]
+
+COUNTRY_ALIASES = {
+    "usa": "United States",
+    "us": "United States",
+    "uk": "United Kingdom",
+    "uae": "United Arab Emirates",
+    "ksa": "Saudi Arabia",
+    "sa": "Saudi Arabia",
+}
 
 SMALL_TOWN_HINTS = [
     "surrounding areas",
@@ -71,6 +80,25 @@ def _append_query(queries: List[str], seen_keys: set, query: str, max_queries: i
 def _split_location_parts(location: str) -> List[str]:
     parts = [re.sub(r"\s+", " ", p).strip() for p in (location or "").split(",")]
     return [p for p in parts if p]
+
+
+def _normalize_country_aliases(location: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (location or "").strip())
+    if not cleaned:
+        return ""
+
+    parts = _split_location_parts(cleaned)
+    if parts:
+        normalized_parts = []
+        for part in parts:
+            lower = part.lower()
+            normalized_parts.append(COUNTRY_ALIASES.get(lower, part))
+        return ", ".join(normalized_parts)
+
+    normalized = cleaned
+    for alias, full in COUNTRY_ALIASES.items():
+        normalized = re.sub(rf"\b{re.escape(alias)}\b", full, normalized, flags=re.I)
+    return normalized
 
 
 def _extract_city_anchor(location: str) -> str:
@@ -154,12 +182,12 @@ def _build_area_hints(cleaned_location: str) -> List[str]:
 def build_citywide_queries(keyword: str, location: str, max_queries: int = 14) -> List[str]:
     """Build multiple Maps search queries with global-first city coverage."""
     cleaned_keyword = re.sub(r"\s+", " ", (keyword or "").strip())
-    cleaned_location = re.sub(r"\s+", " ", (location or "").strip())
+    cleaned_location = _normalize_country_aliases(location)
 
     if not cleaned_keyword or not cleaned_location:
         return []
 
-    max_queries = max(1, min(max_queries, 48))
+    max_queries = max(1, min(max_queries, 72))
     queries: List[str] = []
     seen_keys = set()
 
@@ -203,5 +231,7 @@ def build_citywide_queries(keyword: str, location: str, max_queries: int = 14) -
     if city_anchor:
         _append_query(queries, seen_keys, f"{cleaned_keyword} around greater {city_anchor}", max_queries)
         _append_query(queries, seen_keys, f"{cleaned_keyword} in {city_anchor} metropolitan area", max_queries)
+        _append_query(queries, seen_keys, f"{cleaned_keyword} in and around {city_anchor}", max_queries)
+        _append_query(queries, seen_keys, f"{cleaned_keyword} near {city_anchor} neighboring towns", max_queries)
 
     return queries

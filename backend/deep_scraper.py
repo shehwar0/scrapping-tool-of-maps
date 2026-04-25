@@ -34,14 +34,14 @@ from url_filters import is_business_website, normalize_business_website
 
 MAX_RESULTS_CAP = 500
 RESULT_SCAN_WINDOW = 320
-CITYWIDE_QUERY_LIMIT = 18
+CITYWIDE_QUERY_LIMIT = 30
 MAP_STAGNANT_ROUNDS = 22
 MAP_SCROLL_DELAY_MIN = 0.28
 MAP_SCROLL_DELAY_MAX = 0.55
 REQUEST_TIMEOUT = 15
 QUERY_RETRY_ATTEMPTS = 2
 QUERY_RETRY_BASE_WAIT_MS = 2500
-CAPTCHA_MANUAL_WAIT_MS = 90000
+CAPTCHA_MANUAL_WAIT_MS = 180000
 CAPTCHA_POLL_MS = 1500
 CAPTCHA_MARKERS = (
     "unusual traffic",
@@ -50,6 +50,8 @@ CAPTCHA_MARKERS = (
     "verify you are human",
     "not a robot",
     "g-recaptcha",
+    "our systems have detected unusual traffic",
+    "sorry/index",
 )
 
 # Pages to check for contact info on websites

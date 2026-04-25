@@ -1,4 +1,5 @@
 import csv
+import concurrent.futures
 import logging
 import os
 import re
@@ -6,8 +7,11 @@ from pathlib import Path
 from datetime import datetime
 from threading import Event
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_file
+import requests
+from url_filters import is_business_website
 
 # Import all scrapers for different modes
 # Ultra Deep - uses ALL engines in parallel with cross-verification
@@ -46,6 +50,11 @@ try:
 except ImportError:
     scrape_history = None
 
+try:
+    from email_extractor import WebsiteExtractor
+except ImportError:
+    WebsiteExtractor = None
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
@@ -67,6 +76,22 @@ SCRAPE_STATE = {
     "csv_path": "",
 }
 STOP_EVENT = Event()
+
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_USER_AGENT = "lead-scraper-location-assistant/1.0"
+LOCATION_SUGGEST_TIMEOUT = 8
+LOCATION_SUGGEST_MAX = 10
+EMAIL_ENRICHMENT_MAX_TARGETS = 160
+EMAIL_ENRICHMENT_WORKERS = 6
+
+COUNTRY_ALIASES = {
+    "usa": "United States",
+    "us": "United States",
+    "uk": "United Kingdom",
+    "uae": "United Arab Emirates",
+    "ksa": "Saudi Arabia",
+    "sa": "Saudi Arabia",
+}
 
 
 @app.get("/")
@@ -205,6 +230,22 @@ def get_output_history_files() -> Dict:
     """List CSV output files that can be used as selectable history sources."""
     files = _list_output_history_files()
     return jsonify({"count": len(files), "files": files})
+
+
+@app.get("/location/suggest")
+def suggest_locations() -> Dict:
+    raw_query = (request.args.get("q") or "").strip()
+    if not raw_query:
+        return jsonify({"count": 0, "suggestions": []})
+
+    try:
+        requested_limit = int(request.args.get("limit", LOCATION_SUGGEST_MAX))
+    except (TypeError, ValueError):
+        requested_limit = LOCATION_SUGGEST_MAX
+
+    limit = max(1, min(requested_limit, LOCATION_SUGGEST_MAX))
+    suggestions = _fetch_location_suggestions(raw_query, limit=limit)
+    return jsonify({"count": len(suggestions), "suggestions": suggestions})
 
 
 @app.post("/scrape")
@@ -388,6 +429,9 @@ def scrape() -> Dict:
             if excluded_by_history > 0:
                 log.info("Excluded %d leads using selected/history files", excluded_by_history)
 
+        # Ensure emails are attempted in every mode without re-crawling every lead.
+        results = _enrich_missing_emails(results)
+
         for lead in results:
             if isinstance(lead, dict):
                 lead["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead)
@@ -426,13 +470,13 @@ def scrape() -> Dict:
     except CaptchaDetectedError as exc:
         log.error("Captcha detected: %s", exc)
         SCRAPE_STATE["status"] = "captcha"
-        SCRAPE_STATE["message"] = "Captcha detected. Please try again later."
+        SCRAPE_STATE["message"] = "Captcha detected. Automatic bypass is not supported. Run non-headless mode and solve challenge manually."
         return jsonify({"error": SCRAPE_STATE["message"]}), 429
     except Exception as exc:
         if _looks_like_captcha_error(exc):
             log.error("Captcha-like challenge detected: %s", exc)
             SCRAPE_STATE["status"] = "captcha"
-            SCRAPE_STATE["message"] = "Captcha challenge detected. Run in non-headless mode and solve challenge if prompted."
+            SCRAPE_STATE["message"] = "Captcha challenge detected. Automatic bypass is not supported. Run in non-headless mode and solve challenge if prompted."
             return jsonify({"error": SCRAPE_STATE["message"]}), 429
         log.exception("Scrape failed: %s", exc)
         SCRAPE_STATE["status"] = "error"
@@ -645,6 +689,239 @@ def _build_whatsapp_wa_me_links(lead: Dict[str, str]) -> str:
             numbers.append(digits)
 
     return "; ".join(f"https://wa.me/{number}" for number in numbers)
+
+
+def _fetch_location_suggestions(query: str, limit: int = LOCATION_SUGGEST_MAX) -> List[Dict[str, str]]:
+    expanded_queries = _expand_location_query(query)
+    headers = {
+        "User-Agent": NOMINATIM_USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    seen = set()
+    suggestions: List[Dict[str, str]] = []
+
+    for q in expanded_queries:
+        if len(suggestions) >= limit:
+            break
+
+        params = {
+            "q": q,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": max(limit * 2, 10),
+            "dedupe": 1,
+        }
+
+        try:
+            response = requests.get(
+                NOMINATIM_SEARCH_URL,
+                params=params,
+                headers=headers,
+                timeout=LOCATION_SUGGEST_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                continue
+            payload = response.json()
+        except Exception as exc:
+            log.debug("Location suggestion lookup failed for '%s': %s", q, exc)
+            continue
+
+        if not isinstance(payload, list):
+            continue
+
+        for item in payload:
+            suggestion = _normalize_location_suggestion(item)
+            if not suggestion:
+                continue
+
+            key = (suggestion.get("value") or "").lower()
+            if not key or key in seen:
+                continue
+
+            seen.add(key)
+            suggestions.append(suggestion)
+            if len(suggestions) >= limit:
+                break
+
+    return suggestions
+
+
+def _expand_location_query(query: str) -> List[str]:
+    cleaned = re.sub(r"\s+", " ", (query or "").strip())
+    if not cleaned:
+        return []
+
+    expanded: List[str] = [cleaned]
+    lowered = cleaned.lower()
+    for alias, full_name in COUNTRY_ALIASES.items():
+        alias_pattern = re.compile(rf"\b{re.escape(alias)}\b", re.I)
+        if alias_pattern.search(lowered):
+            expanded.append(alias_pattern.sub(full_name, cleaned))
+
+    deduped: List[str] = []
+    seen = set()
+    for value in expanded:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
+
+
+def _normalize_location_suggestion(item: object) -> Optional[Dict[str, str]]:
+    if not isinstance(item, dict):
+        return None
+
+    address = item.get("address") if isinstance(item.get("address"), dict) else {}
+    display_name = str(item.get("display_name") or "").strip()
+    if not display_name:
+        return None
+
+    city = (
+        address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("municipality")
+        or address.get("county")
+        or ""
+    )
+    state = address.get("state") or address.get("region") or ""
+    country = address.get("country") or ""
+    country_code = str(address.get("country_code") or "").upper()
+
+    pieces = [part for part in [city, state, country] if part]
+    if not pieces:
+        value = display_name
+    else:
+        value = ", ".join(pieces)
+
+    label = value
+    if country_code:
+        label = f"{value} ({country_code})"
+
+    return {
+        "label": label,
+        "value": value,
+        "display_name": display_name,
+        "city": city,
+        "state": state,
+        "country": country,
+        "country_code": country_code,
+        "type": str(item.get("type") or ""),
+    }
+
+
+def _website_host_key(website: str) -> str:
+    raw = (website or "").strip()
+    if not raw:
+        return ""
+    normalized = raw if raw.startswith(("http://", "https://")) else f"https://{raw}"
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or parsed.path).lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _enrich_missing_emails(results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if not results or WebsiteExtractor is None:
+        return results
+
+    website_targets: Dict[str, Dict[str, object]] = {}
+    target_count = 0
+
+    for idx, lead in enumerate(results):
+        if not isinstance(lead, dict):
+            continue
+
+        existing_email = str(lead.get("email", "") or "").strip()
+        website = str(lead.get("website", "") or "").strip()
+        if existing_email or not is_business_website(website):
+            continue
+
+        host_key = _website_host_key(website)
+        if not host_key:
+            continue
+
+        target_count += 1
+        if target_count > EMAIL_ENRICHMENT_MAX_TARGETS:
+            break
+
+        bucket = website_targets.setdefault(
+            host_key,
+            {
+                "website": website,
+                "phone": str(lead.get("phone", "") or "").strip(),
+                "indexes": [],
+            },
+        )
+        bucket["indexes"].append(idx)
+
+    if not website_targets:
+        return results
+
+    log.info("Backfilling missing emails for %d website host(s)", len(website_targets))
+
+    host_results: Dict[str, Dict[str, str]] = {}
+
+    def _enrich_host(host_key: str, data: Dict[str, object]) -> Optional[tuple]:
+        website = str(data.get("website") or "")
+        fallback_phone = str(data.get("phone") or "")
+        if not website:
+            return None
+
+        try:
+            extractor = WebsiteExtractor(timeout=8)
+            enriched = extractor.enrich(website, fallback_phone=fallback_phone)
+            return host_key, {
+                "email": str(enriched.get("email") or "").strip(),
+                "whatsapp": str(enriched.get("whatsapp") or "").strip(),
+            }
+        except Exception as exc:
+            log.debug("Email backfill failed for %s: %s", website, exc)
+            return host_key, {"email": "", "whatsapp": ""}
+
+    max_workers = max(1, min(EMAIL_ENRICHMENT_WORKERS, len(website_targets)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_enrich_host, host_key, data): host_key
+            for host_key, data in website_targets.items()
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            item = future.result()
+            if not item:
+                continue
+            host_key, enriched = item
+            host_results[host_key] = enriched
+
+    updated = 0
+    for host_key, data in website_targets.items():
+        enriched = host_results.get(host_key) or {}
+        email = str(enriched.get("email") or "").strip()
+        whatsapp = str(enriched.get("whatsapp") or "").strip()
+
+        for idx in data.get("indexes", []):
+            lead = results[idx]
+            if not isinstance(lead, dict):
+                continue
+
+            if email and not str(lead.get("email") or "").strip():
+                lead["email"] = email
+                existing_all = str(lead.get("all_emails") or "").strip()
+                lead["all_emails"] = f"{existing_all}; {email}".strip("; ") if existing_all else email
+                updated += 1
+
+            if whatsapp and not str(lead.get("whatsapp") or "").strip():
+                lead["whatsapp"] = whatsapp
+                existing_all_wa = str(lead.get("all_whatsapp") or "").strip()
+                lead["all_whatsapp"] = f"{existing_all_wa}; {whatsapp}".strip("; ") if existing_all_wa else whatsapp
+
+    if updated:
+        log.info("Email backfill updated %d lead(s)", updated)
+
+    return results
 
 
 def _sanitize_token(value: str) -> str:

@@ -96,8 +96,7 @@ select {
 }
 
 .location-suggestions-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   gap: 6px;
 }
 
@@ -105,11 +104,12 @@ select {
   border: 1px solid #d6b08c;
   background: #fff;
   color: #6a3d1f;
-  border-radius: 999px;
-  padding: 5px 10px;
+  border-radius: 10px;
+  padding: 7px 10px;
   font-size: 0.78rem;
   font-weight: 700;
   cursor: pointer;
+  text-align: left;
 }
 
 .location-suggestion-btn:hover {

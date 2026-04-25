@@ -15,6 +15,7 @@ const selectAllHistoryFilesBtn = document.getElementById("selectAllHistoryFilesB
 const clearSelectedHistoryFilesBtn = document.getElementById("clearSelectedHistoryFilesBtn");
 const locationSuggestions = document.getElementById("locationSuggestions");
 const MAX_RESULTS_LIMIT = 500;
+const LOCATION_SUGGESTION_LIMIT = 8;
 
 let pollingId = null;
 let outputHistoryFiles = [];
@@ -23,6 +24,8 @@ let activeScrapeController = null;
 let stopRequestedByUser = false;
 let lastRenderedCount = 0;
 let backendCooldownUntil = 0;
+let locationSuggestController = null;
+let locationSuggestTimer = null;
 
 function canCallBackend() {
   return Date.now() >= backendCooldownUntil;
@@ -244,15 +247,17 @@ function buildLocationFormatSuggestions(rawValue) {
     return [];
   }
 
-  if (cleaned.includes(",")) {
-    return [];
-  }
-
-  return [
+  const options = [
     `${cleaned}, State/Region, Country`,
     `${cleaned}, Country`,
     `${cleaned} metro area, Country`,
   ];
+
+  if (cleaned.includes(",")) {
+    return options.slice(0, 1);
+  }
+
+  return options;
 }
 
 function hideLocationSuggestions() {
@@ -273,21 +278,31 @@ function showLocationSuggestions(inputValue, options) {
 
   const title = document.createElement("small");
   title.className = "location-suggestions-title";
-  title.textContent = `Improve global matching for "${inputValue}" by choosing a structured location:`;
+  title.textContent = `Select exact location for "${inputValue}" (city/state/country):`;
 
   const list = document.createElement("div");
   list.className = "location-suggestions-list";
 
   options.forEach((option) => {
+    const optionLabel = typeof option === "string" ? option : (option.label || option.value || "");
+    const optionValue = typeof option === "string" ? option : (option.value || option.label || "");
+    const optionHint = typeof option === "string" ? "" : (option.display_name || "");
+    if (!optionValue) {
+      return;
+    }
+
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "location-suggestion-btn";
-    btn.textContent = option;
+    btn.textContent = optionLabel;
+    if (optionHint) {
+      btn.title = optionHint;
+    }
     btn.addEventListener("click", () => {
-      locationInput.value = option;
+      locationInput.value = optionValue;
       hideLocationSuggestions();
       locationInput.dispatchEvent(new Event("input", { bubbles: true }));
-      setStatus(`Location format applied: ${option}`);
+      setStatus(`Location selected: ${optionLabel}`);
     });
     list.appendChild(btn);
   });
@@ -297,7 +312,42 @@ function showLocationSuggestions(inputValue, options) {
   locationSuggestions.style.display = "block";
 }
 
-function updateLocationDisambiguation() {
+async function fetchLocationSuggestions(raw) {
+  if (!canCallBackend()) {
+    return [];
+  }
+
+  if (locationSuggestController) {
+    try {
+      locationSuggestController.abort();
+    } catch {
+      // Ignore abort errors.
+    }
+  }
+
+  locationSuggestController = new AbortController();
+
+  try {
+    const res = await fetch(
+      `/location/suggest?q=${encodeURIComponent(raw)}&limit=${LOCATION_SUGGESTION_LIMIT}`,
+      { signal: locationSuggestController.signal }
+    );
+    if (!res.ok) {
+      return [];
+    }
+    const data = await res.json();
+    return Array.isArray(data?.suggestions) ? data.suggestions : [];
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      return [];
+    }
+    return [];
+  } finally {
+    locationSuggestController = null;
+  }
+}
+
+async function updateLocationDisambiguation() {
   if (!locationInput) {
     return;
   }
@@ -308,21 +358,48 @@ function updateLocationDisambiguation() {
     return;
   }
 
-  const suggestions = buildLocationFormatSuggestions(raw);
+  const fallbackSuggestions = buildLocationFormatSuggestions(raw);
+  const normalizedRaw = normalizeLocationText(raw);
 
-  if (!suggestions || suggestions.length === 0) {
+  const backendSuggestions = raw.length >= 2 ? await fetchLocationSuggestions(raw) : [];
+  const combined = [];
+  const seen = new Set();
+
+  backendSuggestions.forEach((item) => {
+    const value = normalizeLocationText(item?.value || item?.label || "");
+    if (!value || seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    combined.push(item);
+  });
+
+  fallbackSuggestions.forEach((value) => {
+    const key = normalizeLocationText(value);
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    combined.push(value);
+  });
+
+  if (!combined || combined.length === 0) {
     hideLocationSuggestions();
     return;
   }
 
-  const normalizedRaw = normalizeLocationText(raw);
-  const alreadySelected = suggestions.some((item) => normalizeLocationText(item) === normalizedRaw);
+  const alreadySelected = combined.some((item) => {
+    if (typeof item === "string") {
+      return normalizeLocationText(item) === normalizedRaw;
+    }
+    return normalizeLocationText(item.value || item.label || "") === normalizedRaw;
+  });
   if (alreadySelected) {
     hideLocationSuggestions();
     return;
   }
 
-  showLocationSuggestions(raw, suggestions);
+  showLocationSuggestions(raw, combined.slice(0, LOCATION_SUGGESTION_LIMIT));
 }
 
 if (keywordInput && locationInput) {
@@ -335,9 +412,17 @@ if (keywordInput && locationInput) {
   keywordInput.addEventListener("input", checkHistory);
   locationInput.addEventListener("input", () => {
     checkHistory();
-    updateLocationDisambiguation();
+    clearTimeout(locationSuggestTimer);
+    locationSuggestTimer = setTimeout(() => {
+      updateLocationDisambiguation();
+    }, 250);
   });
-  locationInput.addEventListener("focus", updateLocationDisambiguation);
+  locationInput.addEventListener("focus", () => {
+    clearTimeout(locationSuggestTimer);
+    locationSuggestTimer = setTimeout(() => {
+      updateLocationDisambiguation();
+    }, 120);
+  });
   locationInput.addEventListener("blur", () => {
     setTimeout(hideLocationSuggestions, 150);
   });
