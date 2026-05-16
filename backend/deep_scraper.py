@@ -13,6 +13,7 @@ import logging
 import random
 import re
 import time
+from html import unescape
 from dataclasses import dataclass, field
 from threading import Event
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -53,6 +54,10 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
+LISTING_TIME_BUDGET_SEC = 70
+WEBSITE_ANALYSIS_BUDGET_SEC = 25
+HEAVY_STEP_MIN_REMAINING_SEC = 12
+GOOGLE_LOOKUP_MIN_REMAINING_SEC = 12
 
 # Pages to check for contact info on websites
 CONTACT_PAGES = [
@@ -137,6 +142,43 @@ EMAIL_PATTERNS = [
     re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}", re.I),
     re.compile(r"mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,})", re.I),
 ]
+MAILTO_PATTERN = re.compile(r"mailto:([^\"'>\s?#]+)", re.I)
+DATA_EMAIL_PATTERN = re.compile(
+    r"(?:data-email|data-mail|data-contact|data-mailto)\s*=\s*['\"]([^'\"]+)['\"]",
+    re.I,
+)
+DATA_USER_DOMAIN_PATTERN = re.compile(
+    r"data-user\s*=\s*['\"]([^'\"]{1,64})['\"][^>]{0,200}data-domain\s*=\s*['\"]([^'\"]{1,253})['\"]",
+    re.I,
+)
+DATA_DOMAIN_USER_PATTERN = re.compile(
+    r"data-domain\s*=\s*['\"]([^'\"]{1,253})['\"][^>]{0,200}data-user\s*=\s*['\"]([^'\"]{1,64})['\"]",
+    re.I,
+)
+JS_EMAIL_JOIN_PATTERN = re.compile(
+    r"['\"]([a-zA-Z0-9._%+-]{1,64})['\"]\s*\+\s*['\"]@['\"]\s*\+\s*['\"]([a-zA-Z0-9.-]{1,253}\.[a-zA-Z]{2,24})['\"]",
+    re.I,
+)
+
+INVALID_EMAIL_DOMAINS = {
+    "example.com",
+    "test.com",
+    "email.com",
+    "domain.com",
+    "yoursite.com",
+    "website.com",
+    "company.com",
+    "business.com",
+    "mail.com",
+    "fake.com",
+    "sample.com",
+    "demo.com",
+    "sentry.io",
+    "wixpress.com",
+    "sentry-next.wixpress.com",
+}
+INVALID_EMAIL_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "pdf"}
+NO_REPLY_LOCAL_PARTS = {"noreply", "no-reply", "do-not-reply", "donotreply", "mailer-daemon"}
 
 # Invalid social handles (generic pages)
 INVALID_SOCIAL_HANDLES = {
@@ -315,21 +357,48 @@ def normalize_phone(phone: str, default_country: str = "92") -> str:
     return digits
 
 
-def extract_emails(html: str) -> List[str]:
-    """Extract unique valid emails from HTML."""
-    emails = []
-    seen = set()
-    
+def extract_emails(html: str, base_domain: str = "") -> List[str]:
+    """Extract unique valid emails from HTML with light prioritization."""
+    if not html:
+        return []
+
+    raw = unescape(html)
+    candidates: List[str] = []
+
     for pattern in EMAIL_PATTERNS:
-        for match in pattern.finditer(html):
-            email = match.group(1) if match.groups() else match.group(0)
-            email = email.lower().strip()
-            
-            if is_valid_email(email) and email not in seen:
-                seen.add(email)
-                emails.append(email)
-    
-    return emails[:10]  # Limit to 10 emails
+        for match in pattern.finditer(raw):
+            candidates.append(match.group(1) if match.groups() else match.group(0))
+
+    for match in MAILTO_PATTERN.findall(raw):
+        candidates.append(match)
+
+    for match in DATA_EMAIL_PATTERN.findall(raw):
+        candidates.append(match)
+
+    for user, domain in DATA_USER_DOMAIN_PATTERN.findall(raw):
+        candidates.append(f"{user}@{domain}")
+    for domain, user in DATA_DOMAIN_USER_PATTERN.findall(raw):
+        candidates.append(f"{user}@{domain}")
+
+    for user, domain in JS_EMAIL_JOIN_PATTERN.findall(raw):
+        candidates.append(f"{user}@{domain}")
+
+    normalized = _normalize_obfuscated_text(raw)
+    for match in EMAIL_PATTERNS[0].finditer(normalized):
+        candidates.append(match.group(0))
+
+    emails: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        email = _normalize_email_candidate(candidate)
+        if not email or not is_valid_email(email):
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        emails.append(email)
+
+    return _rank_emails(emails, base_domain)[:15]
 
 
 def is_valid_email(email: str) -> bool:
@@ -347,19 +416,69 @@ def is_valid_email(email: str) -> bool:
         return False
     
     # Filter fake/invalid domains
-    invalid_domains = [
-        "example.com", "test.com", "email.com", "domain.com",
-        "yoursite.com", "website.com", "company.com", "business.com",
-        "sentry.io", "wixpress.com", "sentry-next.wixpress.com",
-    ]
-    if domain in invalid_domains:
+    if domain in INVALID_EMAIL_DOMAINS:
         return False
-    
-    # Filter image/asset "emails"
-    if any(ext in email for ext in [".png", ".jpg", ".gif", ".svg", ".webp", ".css", ".js"]):
+
+    tld = domain.rsplit(".", 1)[-1]
+    if tld.lower() in INVALID_EMAIL_TLDS:
         return False
     
     return True
+
+
+def _normalize_obfuscated_text(text: str) -> str:
+    cleaned = text
+    cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*at\s*(?:\)|\]|\})?\s*", "@", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*dot\s*(?:\)|\]|\})?\s*", ".", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*\(\s*at\s*\)\s*", "@", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*\[\s*at\s*\]\s*", "@", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*\(\s*dot\s*\)\s*", ".", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*\[\s*dot\s*\]\s*", ".", cleaned, flags=re.I)
+    return cleaned
+
+
+def _normalize_email_candidate(value: str) -> str:
+    if not value:
+        return ""
+    text = unescape(value)
+    text = text.strip().strip("<>[](){}\"' ")
+    if text.lower().startswith("mailto:"):
+        text = text[7:]
+    if "?" in text:
+        text = text.split("?", 1)[0]
+    text = text.strip().strip(".,;:")
+    return text.lower()
+
+
+def _rank_emails(emails: List[str], base_domain: str) -> List[str]:
+    if not emails:
+        return []
+    base_domain = (base_domain or "").lower()
+
+    def score_email(email: str) -> int:
+        local, domain = email.split("@", 1)
+        score = 0
+        if base_domain and (domain == base_domain or domain.endswith("." + base_domain)):
+            score += 3
+        if local in NO_REPLY_LOCAL_PARTS:
+            score -= 2
+        return score
+
+    ranked = sorted(enumerate(emails), key=lambda item: (-score_email(item[1]), item[0]))
+    return [email for _, email in ranked]
+
+
+def _get_base_domain(website_url: str) -> str:
+    try:
+        parsed = urlparse(website_url)
+        host = (parsed.netloc or "").lower().strip()
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
 
 
 def extract_whatsapp(html: str) -> List[str]:
@@ -889,6 +1008,7 @@ class DeepBusinessScraper:
         """Extract comprehensive data from a single listing."""
         for attempt in range(2):
             try:
+                start_time = time.time()
                 page.goto(place_url, timeout=60000)
                 page.wait_for_timeout(1800)
                 self._raise_if_captcha(page)
@@ -918,34 +1038,40 @@ class DeepBusinessScraper:
                     cache_key = self._website_cache_key(data.website)
                     website_data = self._website_cache.get(cache_key)
                     if website_data is None:
-                        website_data = self._deep_analyze_website(page, data.website)
-                        self._website_cache[cache_key] = dict(website_data)
-                    data.data_sources.append("website")
-                    
+                        remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                        if remaining >= HEAVY_STEP_MIN_REMAINING_SEC:
+                            website_data = self._deep_analyze_website(
+                                page,
+                                data.website,
+                                max_total_time_sec=min(WEBSITE_ANALYSIS_BUDGET_SEC, max(10, int(remaining))),
+                            )
+                            self._website_cache[cache_key] = dict(website_data)
                     # Merge website data
-                    data.emails = website_data.get("emails", [])
-                    data.whatsapp_numbers = website_data.get("whatsapp_numbers", [])
-                    
-                    socials = website_data.get("socials", {})
-                    if not data.instagram and socials.get("instagram"):
-                        data.instagram = socials["instagram"]
-                    if not data.facebook and socials.get("facebook"):
-                        data.facebook = socials["facebook"]
-                    if not data.twitter and socials.get("twitter"):
-                        data.twitter = socials["twitter"]
-                    if socials.get("linkedin"):
-                        data.linkedin = socials["linkedin"]
-                    if socials.get("tiktok"):
-                        data.tiktok = socials["tiktok"]
-                    if socials.get("youtube"):
-                        data.youtube = socials["youtube"]
-                    
-                    data.has_chatbot = website_data.get("has_chatbot", False)
-                    data.chatbot_type = website_data.get("chatbot_type", "")
-                    data.has_google_analytics = website_data.get("has_google_analytics", False)
-                    data.has_meta_pixel = website_data.get("has_meta_pixel", False)
-                    data.cms_platform = website_data.get("cms_platform", "")
-                    data.is_automated = data.has_chatbot
+                    if website_data is not None:
+                        data.data_sources.append("website")
+                        data.emails = website_data.get("emails", [])
+                        data.whatsapp_numbers = website_data.get("whatsapp_numbers", [])
+                        
+                        socials = website_data.get("socials", {})
+                        if not data.instagram and socials.get("instagram"):
+                            data.instagram = socials["instagram"]
+                        if not data.facebook and socials.get("facebook"):
+                            data.facebook = socials["facebook"]
+                        if not data.twitter and socials.get("twitter"):
+                            data.twitter = socials["twitter"]
+                        if socials.get("linkedin"):
+                            data.linkedin = socials["linkedin"]
+                        if socials.get("tiktok"):
+                            data.tiktok = socials["tiktok"]
+                        if socials.get("youtube"):
+                            data.youtube = socials["youtube"]
+                        
+                        data.has_chatbot = website_data.get("has_chatbot", False)
+                        data.chatbot_type = website_data.get("chatbot_type", "")
+                        data.has_google_analytics = website_data.get("has_google_analytics", False)
+                        data.has_meta_pixel = website_data.get("has_meta_pixel", False)
+                        data.cms_platform = website_data.get("cms_platform", "")
+                        data.is_automated = data.has_chatbot
 
                 # ===== STEP 3: Google search for additional info =====
                 needs_google_lookup = (
@@ -958,6 +1084,11 @@ class DeepBusinessScraper:
                         or not data.emails
                     )
                 )
+                if needs_google_lookup:
+                    remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                    if remaining < GOOGLE_LOOKUP_MIN_REMAINING_SEC:
+                        needs_google_lookup = False
+
                 if needs_google_lookup:
                     google_key = f"{data.name.strip().lower()}|{location.strip().lower()}"
                     if google_key not in self._google_cache:
@@ -1164,7 +1295,7 @@ class DeepBusinessScraper:
 
         return socials
 
-    def _deep_analyze_website(self, page: Page, website_url: str) -> Dict:
+    def _deep_analyze_website(self, page: Page, website_url: str, max_total_time_sec: int = WEBSITE_ANALYSIS_BUDGET_SEC) -> Dict:
         """Deep website analysis.
 
         Prefer fast HTTP crawling (email_extractor WebsiteExtractor) and only fall back
@@ -1187,14 +1318,22 @@ class DeepBusinessScraper:
 
         base_url = website_url.rstrip("/")
 
+        start_time = time.time()
+        deadline = start_time + max_total_time_sec if max_total_time_sec else None
+
         # ---- Phase 1: HTTP crawl (fast) ----
         try:
             crawler = WebsiteExtractor(timeout=min(12, REQUEST_TIMEOUT))
-            pages = crawler.crawl_pages(base_url, max_pages=8)
+            pages = crawler.crawl_pages(
+                base_url,
+                max_pages=10,
+                max_total_time_sec=max_total_time_sec,
+            )
             if pages:
                 corpus = "\n\n".join(p.html for p in pages if p.html)
+                base_domain = _get_base_domain(base_url)
 
-                combined_data["emails"] = list(dict.fromkeys(extract_emails(corpus)))
+                combined_data["emails"] = list(dict.fromkeys(extract_emails(corpus, base_domain)))
                 combined_data["whatsapp_numbers"] = list(dict.fromkeys(extract_whatsapp(corpus)))
 
                 socials = {}
@@ -1220,7 +1359,8 @@ class DeepBusinessScraper:
                 combined_data["has_meta_pixel"] = bool(analytics.get("meta_pixel"))
                 combined_data["cms_platform"] = detect_cms(corpus) or ""
 
-                return combined_data
+                if combined_data["emails"]:
+                    return combined_data
         except Exception as e:
             self.log.debug("HTTP crawl failed: %s", e)
 
@@ -1228,6 +1368,8 @@ class DeepBusinessScraper:
         pages_to_check = CONTACT_PAGES + SOCIAL_PAGES
 
         for path in pages_to_check[:8]:
+            if deadline and time.time() > deadline:
+                break
             try:
                 url = f"{base_url}{path}"
                 response = page.goto(url, timeout=15000, wait_until="domcontentloaded")
@@ -1238,7 +1380,8 @@ class DeepBusinessScraper:
                 page.wait_for_timeout(1200)
                 html = page.content()
 
-                page_emails = extract_emails(html)
+                base_domain = _get_base_domain(base_url)
+                page_emails = extract_emails(html, base_domain)
                 page_whatsapp = extract_whatsapp(html)
 
                 for email in page_emails:

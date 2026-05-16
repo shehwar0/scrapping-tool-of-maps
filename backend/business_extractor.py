@@ -5,6 +5,7 @@ Enhanced version with better WhatsApp, Instagram, and social media detection.
 """
 
 import re
+from html import unescape
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
@@ -61,6 +62,43 @@ EMAIL_PATTERNS = [
     re.compile(r"[a-zA-Z0-9._%+-]+\s*\[\s*at\s*\]\s*[a-zA-Z0-9.-]+\s*\[\s*dot\s*\]\s*[a-z]{2,}", re.I),
     re.compile(r"[a-zA-Z0-9._%+-]+\s*\(\s*at\s*\)\s*[a-zA-Z0-9.-]+\s*\(\s*dot\s*\)\s*[a-z]{2,}", re.I),
 ]
+MAILTO_PATTERN = re.compile(r"mailto:([^\"'>\s?#]+)", re.I)
+DATA_EMAIL_PATTERN = re.compile(
+    r"(?:data-email|data-mail|data-contact|data-mailto)\s*=\s*['\"]([^'\"]+)['\"]",
+    re.I,
+)
+DATA_USER_DOMAIN_PATTERN = re.compile(
+    r"data-user\s*=\s*['\"]([^'\"]{1,64})['\"][^>]{0,200}data-domain\s*=\s*['\"]([^'\"]{1,253})['\"]",
+    re.I,
+)
+DATA_DOMAIN_USER_PATTERN = re.compile(
+    r"data-domain\s*=\s*['\"]([^'\"]{1,253})['\"][^>]{0,200}data-user\s*=\s*['\"]([^'\"]{1,64})['\"]",
+    re.I,
+)
+JS_EMAIL_JOIN_PATTERN = re.compile(
+    r"['\"]([a-zA-Z0-9._%+-]{1,64})['\"]\s*\+\s*['\"]@['\"]\s*\+\s*['\"]([a-zA-Z0-9.-]{1,253}\.[a-zA-Z]{2,24})['\"]",
+    re.I,
+)
+
+INVALID_EMAIL_DOMAINS = {
+    "example.com",
+    "test.com",
+    "email.com",
+    "domain.com",
+    "yoursite.com",
+    "website.com",
+    "company.com",
+    "business.com",
+    "mail.com",
+    "fake.com",
+    "sample.com",
+    "demo.com",
+    "sentry.io",
+    "wixpress.com",
+    "sentry-next.wixpress.com",
+}
+INVALID_EMAIL_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "pdf"}
+NO_REPLY_LOCAL_PARTS = {"noreply", "no-reply", "do-not-reply", "donotreply", "mailer-daemon"}
 
 PHONE_PATTERN = re.compile(r"(\+?\d[\d\s().\-]{6,}\d)")
 
@@ -239,32 +277,41 @@ class WebsiteAnalyzer:
         """Thorough email extraction including obfuscated ones."""
         emails: List[str] = []
         seen: Set[str] = set()
-        
-        # Standard email pattern
+        raw = unescape(self.html)
+
+        candidates: List[str] = []
         for pattern in EMAIL_PATTERNS:
-            for match in pattern.finditer(self.html):
-                email = match.group(0).lower()
-                # Convert obfuscated formats
-                email = re.sub(r"\s*\[\s*at\s*\]\s*", "@", email)
-                email = re.sub(r"\s*\(\s*at\s*\)\s*", "@", email)
-                email = re.sub(r"\s*\[\s*dot\s*\]\s*", ".", email)
-                email = re.sub(r"\s*\(\s*dot\s*\)\s*", ".", email)
-                
-                if self._is_valid_email(email) and email not in seen:
-                    seen.add(email)
-                    emails.append(email)
-        
-        # Check mailto links
-        mailto_pattern = re.compile(r'href=["\']mailto:([^"\'?]+)', re.I)
-        for match in mailto_pattern.finditer(self.html):
-            email = match.group(1).lower().strip()
-            if self._is_valid_email(email) and email not in seen:
-                seen.add(email)
-                emails.append(email)
-        
-        # Filter out generic/spam emails
-        filtered = [e for e in emails if not self._is_generic_email(e)]
-        return filtered if filtered else emails[:3]  # Return top 3 if all generic
+            for match in pattern.finditer(raw):
+                candidates.append(match.group(0))
+
+        for match in MAILTO_PATTERN.findall(raw):
+            candidates.append(match)
+
+        for match in DATA_EMAIL_PATTERN.findall(raw):
+            candidates.append(match)
+
+        for user, domain in DATA_USER_DOMAIN_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+        for domain, user in DATA_DOMAIN_USER_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+
+        for user, domain in JS_EMAIL_JOIN_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+
+        normalized = self._normalize_obfuscated_text(raw)
+        for match in EMAIL_PATTERNS[0].finditer(normalized):
+            candidates.append(match.group(0))
+
+        for candidate in candidates:
+            email = self._normalize_email_candidate(candidate)
+            if not email or not self._is_valid_email(email):
+                continue
+            if email in seen:
+                continue
+            seen.add(email)
+            emails.append(email)
+
+        return self._rank_emails(emails)
     
     def extract_social_media(self) -> Dict[str, str]:
         """Extract all social media profiles."""
@@ -344,8 +391,11 @@ class WebsiteAnalyzer:
         if not local or not domain or "." not in domain:
             return False
         # Filter obvious non-emails
-        invalid_domains = ["example.com", "test.com", "email.com", "domain.com", "sentry.io"]
-        if domain in invalid_domains:
+        if domain in INVALID_EMAIL_DOMAINS:
+            return False
+
+        tld = domain.rsplit(".", 1)[-1]
+        if tld.lower() in INVALID_EMAIL_TLDS:
             return False
         return True
     
@@ -353,6 +403,49 @@ class WebsiteAnalyzer:
         """Check if email is generic/support type."""
         generic = ["noreply", "no-reply", "support@", "info@", "admin@", "webmaster@", "postmaster@"]
         return any(g in email.lower() for g in generic)
+
+    def _normalize_obfuscated_text(self, text: str) -> str:
+        cleaned = text
+        cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*at\s*(?:\)|\]|\})?\s*", "@", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*dot\s*(?:\)|\]|\})?\s*", ".", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*\(\s*at\s*\)\s*", "@", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*\[\s*at\s*\]\s*", "@", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*\(\s*dot\s*\)\s*", ".", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*\[\s*dot\s*\]\s*", ".", cleaned, flags=re.I)
+        return cleaned
+
+    def _normalize_email_candidate(self, value: str) -> str:
+        if not value:
+            return ""
+        text = unescape(value)
+        text = text.strip().strip("<>[](){}\"' ")
+        if text.lower().startswith("mailto:"):
+            text = text[7:]
+        if "?" in text:
+            text = text.split("?", 1)[0]
+        text = text.strip().strip(".,;:")
+        return text.lower()
+
+    def _rank_emails(self, emails: List[str]) -> List[str]:
+        if not emails:
+            return []
+        base_domain = (self.domain or "").lower().strip()
+        if base_domain.startswith("www."):
+            base_domain = base_domain[4:]
+
+        def score_email(email: str) -> int:
+            local, domain = email.split("@", 1)
+            score = 0
+            if base_domain and (domain == base_domain or domain.endswith("." + base_domain)):
+                score += 3
+            if local in NO_REPLY_LOCAL_PARTS:
+                score -= 2
+            if self._is_generic_email(email):
+                score -= 1
+            return score
+
+        ranked = sorted(enumerate(emails), key=lambda item: (-score_email(item[1]), item[0]))
+        return [email for _, email in ranked]
     
     def _is_generic_social(self, handle: str) -> bool:
         """Check if social handle is generic."""

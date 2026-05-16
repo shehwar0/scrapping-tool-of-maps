@@ -34,6 +34,9 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
+LISTING_TIME_BUDGET_SEC = 45
+WEBSITE_ENRICH_BUDGET_SEC = 18
+HEAVY_STEP_MIN_REMAINING_SEC = 8
 
 
 class CaptchaDetectedError(RuntimeError):
@@ -344,6 +347,7 @@ class GoogleMapsScraper:
     def _extract_single_listing(self, page, place_url: str) -> Optional[Dict[str, str]]:
         for attempt in range(2):
             try:
+                start_time = time.time()
                 page.goto(place_url, timeout=60000)
                 page.wait_for_timeout(1200)
                 self._raise_if_captcha(page)
@@ -356,7 +360,20 @@ class GoogleMapsScraper:
                     cache_key = self._website_cache_key(website)
                     enrichment = self._enrichment_cache.get(cache_key)
                     if enrichment is None:
-                        enrichment = self.website_extractor.enrich(website, fallback_phone=phone)
+                        remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                        if remaining < HEAVY_STEP_MIN_REMAINING_SEC:
+                            enrichment = {
+                                "email": "",
+                                "whatsapp": self.website_extractor._normalize_phone(phone),
+                            }
+                        else:
+                            enrichment = self.website_extractor.enrich(
+                                website,
+                                fallback_phone=phone,
+                                max_pages=5,
+                                max_total_time_sec=min(WEBSITE_ENRICH_BUDGET_SEC, max(6, int(remaining))),
+                                priority_only=True,
+                            )
                         self._enrichment_cache[cache_key] = dict(enrichment)
                 else:
                     enrichment = {

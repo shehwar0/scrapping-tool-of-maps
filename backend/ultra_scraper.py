@@ -106,6 +106,11 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
+LISTING_TIME_BUDGET_SEC = 90
+WEBSITE_ANALYSIS_BUDGET_SEC = 30
+HEAVY_STEP_MIN_REMAINING_SEC = 15
+GOOGLE_LOOKUP_MIN_REMAINING_SEC = 12
+SOCIAL_VERIFY_MIN_REMAINING_SEC = 12
 
 # Extended contact pages for ultra deep scan
 ULTRA_CONTACT_PAGES = [
@@ -132,6 +137,19 @@ ULTRA_CONTACT_PAGES = [
 ]
 
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s()\-\.]{6,}\d)")
+
+
+def _get_base_domain(website_url: str) -> str:
+    try:
+        parsed = urlparse(website_url)
+        host = (parsed.netloc or "").lower().strip()
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
 
 
 # ============================================================================
@@ -306,8 +324,9 @@ class DeepExtractionEngine(ExtractionEngine):
     """Deep extraction using deep_scraper patterns."""
     
     def extract_from_html(self, html: str, url: str = "") -> Dict[str, Any]:
+        base_domain = _get_base_domain(url)
         result = {
-            "emails": extract_emails(html),
+            "emails": extract_emails(html, base_domain),
             "whatsapp": extract_whatsapp(html),
             "instagram": extract_social_handle(html, INSTAGRAM_PATTERNS, "instagram"),
             "facebook": extract_social_handle(html, FACEBOOK_PATTERNS, "facebook"),
@@ -900,6 +919,7 @@ class UltraDeepScraper:
         """Ultra deep extraction for a single business."""
         for attempt in range(2):
             try:
+                start_time = time.time()
                 page.goto(place_url, timeout=60000)
                 page.wait_for_timeout(1800)
                 self._raise_if_captcha(page)
@@ -998,37 +1018,45 @@ class UltraDeepScraper:
                     cache_key = self._website_cache_key(data.website)
                     engine_results = self._website_engine_cache.get(cache_key)
                     if engine_results is None:
-                        engine_results = self._multi_engine_website_analysis(page, data.website, data.phone)
-                        self._website_engine_cache[cache_key] = list(engine_results)
+                        remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                        if remaining >= HEAVY_STEP_MIN_REMAINING_SEC:
+                            engine_results = self._multi_engine_website_analysis(
+                                page,
+                                data.website,
+                                data.phone,
+                                max_total_time_sec=min(WEBSITE_ANALYSIS_BUDGET_SEC, max(12, int(remaining))),
+                            )
+                            self._website_engine_cache[cache_key] = list(engine_results)
                     
-                    # Cross-verify results
-                    verified = self.verifier.merge_and_verify(engine_results)
-                    data.data_sources.append("website_multi_engine")
-                    
-                    # Apply verified data
-                    data.emails = verified.get("emails", [])
-                    data.emails_verified = verified.get("emails_verified", [])
-                    data.whatsapp_numbers = verified.get("whatsapp", [])
-                    data.whatsapp_verified = verified.get("whatsapp_verified", [])
-                    
-                    if not data.instagram and verified.get("instagram"):
-                        data.instagram = verified["instagram"]
-                        data.instagram_verified = verified.get("instagram_verified", False)
-                    
-                    if not data.facebook and verified.get("facebook"):
-                        data.facebook = verified["facebook"]
-                        data.facebook_verified = verified.get("facebook_verified", False)
-                    
-                    for social in ["twitter", "linkedin", "tiktok", "youtube"]:
-                        if verified.get(social):
-                            setattr(data, social, verified[social])
-                    
-                    data.has_chatbot = verified.get("has_chatbot", False)
-                    data.chatbot_type = verified.get("chatbot_type", "")
-                    data.has_google_analytics = verified.get("has_google_analytics", False)
-                    data.has_meta_pixel = verified.get("has_meta_pixel", False)
-                    data.cms_platform = verified.get("cms", "")
-                    data.is_automated = data.has_chatbot
+                    if engine_results is not None:
+                        # Cross-verify results
+                        verified = self.verifier.merge_and_verify(engine_results)
+                        data.data_sources.append("website_multi_engine")
+                        
+                        # Apply verified data
+                        data.emails = verified.get("emails", [])
+                        data.emails_verified = verified.get("emails_verified", [])
+                        data.whatsapp_numbers = verified.get("whatsapp", [])
+                        data.whatsapp_verified = verified.get("whatsapp_verified", [])
+                        
+                        if not data.instagram and verified.get("instagram"):
+                            data.instagram = verified["instagram"]
+                            data.instagram_verified = verified.get("instagram_verified", False)
+                        
+                        if not data.facebook and verified.get("facebook"):
+                            data.facebook = verified["facebook"]
+                            data.facebook_verified = verified.get("facebook_verified", False)
+                        
+                        for social in ["twitter", "linkedin", "tiktok", "youtube"]:
+                            if verified.get(social):
+                                setattr(data, social, verified[social])
+                        
+                        data.has_chatbot = verified.get("has_chatbot", False)
+                        data.chatbot_type = verified.get("chatbot_type", "")
+                        data.has_google_analytics = verified.get("has_google_analytics", False)
+                        data.has_meta_pixel = verified.get("has_meta_pixel", False)
+                        data.cms_platform = verified.get("cms", "")
+                        data.is_automated = data.has_chatbot
 
                 # ===== PHASE 3: Google Search Cross-Verification =====
                 needs_google_lookup = (
@@ -1040,6 +1068,11 @@ class UltraDeepScraper:
                         or not data.emails
                     )
                 )
+                if needs_google_lookup:
+                    remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                    if remaining < GOOGLE_LOOKUP_MIN_REMAINING_SEC:
+                        needs_google_lookup = False
+
                 if needs_google_lookup:
                     google_key = f"{data.name.strip().lower()}|{location.strip().lower()}"
                     if google_key not in self._google_verify_cache:
@@ -1058,7 +1091,13 @@ class UltraDeepScraper:
                             data.emails = [google_data["email"]]
 
                 # ===== PHASE 4: Social Media Verification =====
-                if self.verify_socials:
+                do_verify_socials = self.verify_socials
+                if do_verify_socials:
+                    remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                    if remaining < SOCIAL_VERIFY_MIN_REMAINING_SEC:
+                        do_verify_socials = False
+
+                if do_verify_socials:
                     if data.instagram and not data.instagram_verified:
                         if self._verify_instagram(page, data.instagram, data.name):
                             data.instagram_verified = True
@@ -1085,7 +1124,13 @@ class UltraDeepScraper:
 
         return None
 
-    def _multi_engine_website_analysis(self, page: Page, website_url: str, phone: str) -> List[Dict]:
+    def _multi_engine_website_analysis(
+        self,
+        page: Page,
+        website_url: str,
+        phone: str,
+        max_total_time_sec: int = WEBSITE_ANALYSIS_BUDGET_SEC,
+    ) -> List[Dict]:
         """Run multiple extraction engines on a website.
 
         Prefer fast HTTP crawling (email_extractor WebsiteExtractor) and only fall back to
@@ -1098,9 +1143,15 @@ class UltraDeepScraper:
 
         base_url = website_url.rstrip("/")
 
+        start_time = time.time()
+        deadline = start_time + max_total_time_sec if max_total_time_sec else None
         combined_html = ""
         try:
-            pages = self.email_engine.extractor.crawl_pages(base_url, max_pages=10)
+            pages = self.email_engine.extractor.crawl_pages(
+                base_url,
+                max_pages=10,
+                max_total_time_sec=max_total_time_sec,
+            )
             if pages:
                 combined_html = "\n\n".join(p.html for p in pages if p.html)
         except Exception as e:
@@ -1110,6 +1161,8 @@ class UltraDeepScraper:
         if not combined_html:
             all_html: List[Tuple[str, str]] = []
             for path in ULTRA_CONTACT_PAGES[:4]:
+                if deadline and time.time() > deadline:
+                    break
                 try:
                     url = f"{base_url}{path}"
                     response = page.goto(url, timeout=12000, wait_until="domcontentloaded")

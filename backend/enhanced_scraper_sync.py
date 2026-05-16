@@ -41,6 +41,9 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
+LISTING_TIME_BUDGET_SEC = 55
+WEBSITE_ANALYSIS_BUDGET_SEC = 22
+HEAVY_STEP_MIN_REMAINING_SEC = 10
 
 # Pages to check for contact info (in order of priority)
 CONTACT_PAGES = ["", "/contact", "/contact-us", "/about", "/about-us", "/team"]
@@ -375,6 +378,7 @@ class GoogleMapsScraper:
         """Extract comprehensive data from a single Google Maps listing."""
         for attempt in range(2):
             try:
+                start_time = time.time()
                 page.goto(place_url, timeout=60000)
                 page.wait_for_timeout(1500)
                 self._raise_if_captcha(page)
@@ -405,31 +409,42 @@ class GoogleMapsScraper:
                     cache_key = self._website_cache_key(data.website)
                     website_data = self._website_cache.get(cache_key)
                     if website_data is None:
-                        website_data = self._analyze_website(page, data.website)
-                        self._website_cache[cache_key] = dict(website_data)
-                    
-                    # Merge website data
-                    data.emails = website_data.get("emails", [])
-                    data.whatsapp_numbers = website_data.get("whatsapp_numbers", [])
-                    
-                    socials = website_data.get("socials", {})
-                    if not data.instagram:
-                        data.instagram = socials.get("instagram", "")
-                    if not data.facebook:
-                        data.facebook = socials.get("facebook", "")
-                    if not data.twitter:
-                        data.twitter = socials.get("twitter", "")
-                    data.linkedin = socials.get("linkedin", "")
-                    data.tiktok = socials.get("tiktok", "")
-                    data.youtube = socials.get("youtube", "")
-                    
-                    data.has_chatbot = website_data.get("has_chatbot", False)
-                    data.chatbot_type = website_data.get("chatbot_type", "")
-                    data.has_google_analytics = website_data.get("has_google_analytics", False)
-                    data.has_meta_pixel = website_data.get("has_meta_pixel", False)
-                    data.has_other_analytics = website_data.get("other_analytics", [])
-                    data.cms_platform = website_data.get("cms_platform", "")
-                    data.is_automated = data.has_chatbot
+                        remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                        if remaining >= HEAVY_STEP_MIN_REMAINING_SEC:
+                            website_data = self._analyze_website(
+                                page,
+                                data.website,
+                                max_total_time_sec=min(WEBSITE_ANALYSIS_BUDGET_SEC, max(8, int(remaining))),
+                            )
+                            self._website_cache[cache_key] = dict(website_data)
+
+                    if website_data is not None:
+                        # Merge website data
+                        data.emails = website_data.get("emails", [])
+                        data.whatsapp_numbers = website_data.get("whatsapp_numbers", [])
+                        
+                        socials = website_data.get("socials", {})
+                        if not data.instagram:
+                            data.instagram = socials.get("instagram", "")
+                        if not data.facebook:
+                            data.facebook = socials.get("facebook", "")
+                        if not data.twitter:
+                            data.twitter = socials.get("twitter", "")
+                        data.linkedin = socials.get("linkedin", "")
+                        data.tiktok = socials.get("tiktok", "")
+                        data.youtube = socials.get("youtube", "")
+                        
+                        data.has_chatbot = website_data.get("has_chatbot", False)
+                        data.chatbot_type = website_data.get("chatbot_type", "")
+                        data.has_google_analytics = website_data.get("has_google_analytics", False)
+                        data.has_meta_pixel = website_data.get("has_meta_pixel", False)
+                        data.has_other_analytics = website_data.get("other_analytics", [])
+                        data.cms_platform = website_data.get("cms_platform", "")
+                        data.is_automated = data.has_chatbot
+                    elif data.phone:
+                        normalized = self._normalize_phone(data.phone)
+                        if normalized:
+                            data.whatsapp_numbers = [normalized]
                 else:
                     # Use phone as WhatsApp fallback
                     if data.phone:
@@ -645,7 +660,7 @@ class GoogleMapsScraper:
             host = host[4:]
         return host
     
-    def _analyze_website(self, page: Page, website_url: str) -> Dict:
+    def _analyze_website(self, page: Page, website_url: str, max_total_time_sec: int = WEBSITE_ANALYSIS_BUDGET_SEC) -> Dict:
         """Analyze a business website for contact info + tech stack.
 
         Prefer fast HTTP crawling (email_extractor WebsiteExtractor) and only fall back
@@ -668,10 +683,17 @@ class GoogleMapsScraper:
 
         base_url = website_url.rstrip("/")
 
+        start_time = time.time()
+        deadline = start_time + max_total_time_sec if max_total_time_sec else None
+
         # ---- Phase 1: HTTP crawl (fast) ----
         try:
             crawler = WebsiteExtractor(timeout=12)
-            pages = crawler.crawl_pages(base_url, max_pages=8)
+            pages = crawler.crawl_pages(
+                base_url,
+                max_pages=10,
+                max_total_time_sec=max_total_time_sec,
+            )
             if pages:
                 corpus = "\n\n".join(p.html for p in pages if p.html)
                 page_data = analyze_website(corpus, base_url)
@@ -685,12 +707,15 @@ class GoogleMapsScraper:
                 combined_data["has_meta_pixel"] = bool(page_data.get("has_meta_pixel"))
                 combined_data["other_analytics"] = list(dict.fromkeys(page_data.get("other_analytics", []) or []))
                 combined_data["cms_platform"] = page_data.get("cms_platform", "") or ""
-                return combined_data
+                if combined_data["emails"]:
+                    return combined_data
         except Exception as e:
             self.log.debug("HTTP crawl failed: %s", e)
 
         # ---- Phase 2: Playwright fallback ----
         for path in CONTACT_PAGES:
+            if deadline and time.time() > deadline:
+                break
             try:
                 url = f"{base_url}{path}"
                 response = page.goto(url, timeout=15000, wait_until="domcontentloaded")

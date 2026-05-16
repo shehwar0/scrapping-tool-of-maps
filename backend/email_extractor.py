@@ -1,4 +1,5 @@
 import re
+import time
 from dataclasses import dataclass
 from html import unescape
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -42,6 +43,43 @@ OBFUSCATED_EMAIL_PATTERN = re.compile(
     r"([a-zA-Z]{2,24})",
     re.IGNORECASE,
 )
+MAILTO_PATTERN = re.compile(r"mailto:([^\"'>\s?#]+)", re.IGNORECASE)
+DATA_EMAIL_PATTERN = re.compile(
+    r"(?:data-email|data-mail|data-contact|data-mailto)\s*=\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+DATA_USER_DOMAIN_PATTERN = re.compile(
+    r"data-user\s*=\s*['\"]([^'\"]{1,64})['\"][^>]{0,200}data-domain\s*=\s*['\"]([^'\"]{1,253})['\"]",
+    re.IGNORECASE,
+)
+DATA_DOMAIN_USER_PATTERN = re.compile(
+    r"data-domain\s*=\s*['\"]([^'\"]{1,253})['\"][^>]{0,200}data-user\s*=\s*['\"]([^'\"]{1,64})['\"]",
+    re.IGNORECASE,
+)
+JS_EMAIL_JOIN_PATTERN = re.compile(
+    r"['\"]([a-zA-Z0-9._%+-]{1,64})['\"]\s*\+\s*['\"]@['\"]\s*\+\s*['\"]([a-zA-Z0-9.-]{1,253}\.[a-zA-Z]{2,24})['\"]",
+    re.IGNORECASE,
+)
+
+INVALID_EMAIL_DOMAINS = {
+    "example.com",
+    "test.com",
+    "email.com",
+    "domain.com",
+    "yoursite.com",
+    "website.com",
+    "company.com",
+    "business.com",
+    "mail.com",
+    "fake.com",
+    "sample.com",
+    "demo.com",
+    "sentry.io",
+    "wixpress.com",
+    "sentry-next.wixpress.com",
+}
+INVALID_EMAIL_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "pdf"}
+NO_REPLY_LOCAL_PARTS = {"noreply", "no-reply", "do-not-reply", "donotreply", "mailer-daemon"}
 
 WHATSAPP_LINK_PATTERN = re.compile(r"(?:wa\.me/|phone=)(\+?\d{6,15})", re.IGNORECASE)
 WHATSAPP_REF_PATTERN = re.compile(
@@ -52,21 +90,35 @@ GENERIC_PHONE_PATTERN = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 DIGIT_PATTERN = re.compile(r"\d+")
 
 # Prioritized internal pages and keywords for deep enrichment
+PRIMARY_PATHS = [
+    "",
+    "/contact",
+    "/contact-us",
+    "/about",
+    "/about-us",
+]
+
 DEFAULT_PATHS = [
     "",
     "/contact",
     "/contact-us",
     "/contactus",
+    "/reach-us",
+    "/get-in-touch",
+    "/connect",
     "/about",
     "/about-us",
     "/aboutus",
     "/team",
     "/support",
     "/help",
+    "/customer-service",
     "/privacy",
     "/terms",
     "/legal",
     "/impressum",
+    "/kontakt",
+    "/contacto",
 ]
 
 PRIORITY_LINK_KEYWORDS = (
@@ -75,6 +127,8 @@ PRIORITY_LINK_KEYWORDS = (
     "team",
     "support",
     "help",
+    "email",
+    "sales",
     "privacy",
     "terms",
     "legal",
@@ -133,7 +187,14 @@ class WebsiteExtractor:
         self._blocked_hosts: Set[str] = set()
         self._host_block_threshold = 3
 
-    def enrich(self, website_url: str, fallback_phone: str = "") -> Dict[str, str]:
+    def enrich(
+        self,
+        website_url: str,
+        fallback_phone: str = "",
+        max_pages: int = 10,
+        max_total_time_sec: int = 25,
+        priority_only: bool = False,
+    ) -> Dict[str, str]:
         """Return {email, whatsapp} by crawling a small set of internal pages."""
         if not website_url:
             return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
@@ -142,10 +203,16 @@ class WebsiteExtractor:
         if not normalized:
             return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
 
-        pages = self.crawl_pages(normalized, max_pages=8)
+        pages = self.crawl_pages(
+            normalized,
+            max_pages=max_pages,
+            max_total_time_sec=max_total_time_sec,
+            priority_only=priority_only,
+        )
         if not pages:
             return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
 
+        base_domain = self._get_base_domain(normalized)
         emails: List[str] = []
         whatsapp_numbers: List[str] = []
 
@@ -164,11 +231,19 @@ class WebsiteExtractor:
             if emails and whatsapp_numbers:
                 break
 
+        emails = self._rank_emails(emails, base_domain)
         whatsapp = whatsapp_numbers[0] if whatsapp_numbers else self._normalize_phone(fallback_phone)
         email = emails[0] if emails else ""
         return {"email": email, "whatsapp": whatsapp}
 
-    def crawl_pages(self, website_url: str, max_pages: int = 8, max_bytes_per_page: int = 1_500_000) -> List[CrawledPage]:
+    def crawl_pages(
+        self,
+        website_url: str,
+        max_pages: int = 10,
+        max_bytes_per_page: int = 1_500_000,
+        max_total_time_sec: int = 25,
+        priority_only: bool = False,
+    ) -> List[CrawledPage]:
         """Crawl a small, bounded set of internal pages and return HTML corpus."""
         base = self._normalize_url(website_url)
         if not base:
@@ -176,13 +251,45 @@ class WebsiteExtractor:
 
         to_visit: List[str] = []
         seen: Set[str] = set()
+        crawled: List[CrawledPage] = []
+        start_time = time.time()
+
+        def _time_exceeded() -> bool:
+            if max_total_time_sec is None:
+                return False
+            return (time.time() - start_time) > max_total_time_sec
 
         # Seed with common paths
-        for p in DEFAULT_PATHS:
+        seed_paths = PRIMARY_PATHS if priority_only else DEFAULT_PATHS
+        for p in seed_paths:
             to_visit.append(urljoin(base + "/", p.lstrip("/")))
+
+        if priority_only:
+            while to_visit and len(crawled) < max_pages:
+                if _time_exceeded():
+                    break
+                url = (to_visit.pop(0) or "").strip()
+                if not url:
+                    continue
+                norm_url = self._normalize_full_url(url)
+                if not norm_url or norm_url in seen:
+                    continue
+                if not self._is_same_site(base, norm_url):
+                    continue
+
+                seen.add(norm_url)
+                html = self._safe_get_html(norm_url, max_bytes=max_bytes_per_page)
+                if not html:
+                    continue
+                crawled.append(CrawledPage(url=norm_url, html=html))
+
+            return crawled
 
         # Also try robots/sitemap for hints (best-effort)
         sitemap_hint_urls: List[str] = []
+        if _time_exceeded():
+            return crawled
+
         robots = self._safe_get_text(urljoin(base + "/", "robots.txt"), max_bytes=200_000)
         if robots:
             for line in robots.splitlines():
@@ -193,6 +300,8 @@ class WebsiteExtractor:
         sitemap_hint_urls.append(urljoin(base + "/", "sitemap.xml"))
 
         for sm in sitemap_hint_urls[:2]:
+            if _time_exceeded():
+                return crawled
             sm_xml = self._safe_get_text(sm, max_bytes=600_000)
             if not sm_xml:
                 continue
@@ -202,9 +311,9 @@ class WebsiteExtractor:
                 if any(k in ml for k in PRIORITY_LINK_KEYWORDS):
                     to_visit.append(m.strip())
 
-        crawled: List[CrawledPage] = []
-
         while to_visit and len(crawled) < max_pages:
+            if _time_exceeded():
+                break
             url = (to_visit.pop(0) or "").strip()
             if not url:
                 continue
@@ -223,6 +332,8 @@ class WebsiteExtractor:
 
             # Discover more internal candidate links from the first 1-2 pages
             if len(crawled) <= 2 and len(crawled) < max_pages:
+                if _time_exceeded():
+                    break
                 for link in self._discover_priority_links(html, base):
                     if link not in seen and link not in to_visit:
                         to_visit.append(link)
@@ -387,24 +498,121 @@ class WebsiteExtractor:
         if not html:
             return []
         raw = unescape(html)
+        candidates: List[str] = []
 
-        matches = EMAIL_PATTERN.findall(raw)
-        # Also attempt to parse obfuscated emails
+        candidates.extend(EMAIL_PATTERN.findall(raw))
+
+        for m in MAILTO_PATTERN.findall(raw):
+            candidates.append(m)
+
+        for m in DATA_EMAIL_PATTERN.findall(raw):
+            candidates.append(m)
+
+        for user, domain in DATA_USER_DOMAIN_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+        for domain, user in DATA_DOMAIN_USER_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+
+        for user, domain in JS_EMAIL_JOIN_PATTERN.findall(raw):
+            candidates.append(f"{user}@{domain}")
+
+        normalized = self._normalize_obfuscated_text(raw)
+        candidates.extend(EMAIL_PATTERN.findall(normalized))
+
+        # Also attempt to parse obfuscated emails (legacy pattern)
         for m in OBFUSCATED_EMAIL_PATTERN.findall(raw):
             try:
                 local, domain, tld = m
                 candidate = f"{local}@{domain}.{tld}"
-                if EMAIL_PATTERN.fullmatch(candidate):
-                    matches.append(candidate)
+                candidates.append(candidate)
             except Exception:
                 continue
 
         # JSON-LD can include email fields
         for email in self._extract_emails_from_jsonld(raw):
-            matches.append(email)
+            candidates.append(email)
 
-        deduped = list(dict.fromkeys([m.lower() for m in matches if m]))
+        deduped: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            normalized_email = self._normalize_email_candidate(candidate)
+            if not normalized_email:
+                continue
+            if not self._is_valid_email(normalized_email):
+                continue
+            if normalized_email in seen:
+                continue
+            seen.add(normalized_email)
+            deduped.append(normalized_email)
+
         return deduped
+
+    def _normalize_obfuscated_text(self, text: str) -> str:
+        cleaned = text
+        cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*at\s*(?:\)|\]|\})?\s*", "@", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*(?:\(|\[|\{)?\s*dot\s*(?:\)|\]|\})?\s*", ".", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*\(\s*at\s*\)\s*", "@", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*\[\s*at\s*\]\s*", "@", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*\(\s*dot\s*\)\s*", ".", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*\[\s*dot\s*\]\s*", ".", cleaned, flags=re.IGNORECASE)
+        return cleaned
+
+    def _normalize_email_candidate(self, value: str) -> str:
+        if not value:
+            return ""
+        text = unescape(value)
+        text = unquote(text)
+        text = text.strip().strip("<>[](){}\"' ")
+        if text.lower().startswith("mailto:"):
+            text = text[7:]
+        if "?" in text:
+            text = text.split("?", 1)[0]
+        text = text.strip().strip(".,;:")
+        return text.lower()
+
+    def _is_valid_email(self, email: str) -> bool:
+        if not email or "@" not in email or email.count("@") != 1:
+            return False
+        local, domain = email.split("@", 1)
+        if not local or not domain or "." not in domain:
+            return False
+        if len(local) > 64 or len(domain) > 255:
+            return False
+        if domain in INVALID_EMAIL_DOMAINS:
+            return False
+        tld = domain.rsplit(".", 1)[-1]
+        if tld.lower() in INVALID_EMAIL_TLDS:
+            return False
+        return True
+
+    def _get_base_domain(self, website_url: str) -> str:
+        try:
+            parsed = urlparse(website_url)
+            host = (parsed.netloc or "").lower().strip()
+            if ":" in host:
+                host = host.split(":", 1)[0]
+            if host.startswith("www."):
+                host = host[4:]
+            return host
+        except Exception:
+            return ""
+
+    def _rank_emails(self, emails: List[str], base_domain: str) -> List[str]:
+        if not emails:
+            return []
+        base_domain = (base_domain or "").lower()
+
+        def score_email(email: str) -> int:
+            score = 0
+            local, domain = email.split("@", 1)
+            if base_domain and (domain == base_domain or domain.endswith("." + base_domain)):
+                score += 3
+            if local in NO_REPLY_LOCAL_PARTS:
+                score -= 2
+            return score
+
+        ranked = sorted(enumerate(emails), key=lambda item: (-score_email(item[1]), item[0]))
+        return [email for _, email in ranked]
 
     def _extract_emails_from_jsonld(self, html: str) -> List[str]:
         emails: List[str] = []

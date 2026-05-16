@@ -74,6 +74,8 @@ SCRAPE_STATE = {
     "message": "Ready",
     "results": [],
     "csv_path": "",
+    "keyword": "",
+    "location": "",
 }
 STOP_EVENT = Event()
 
@@ -317,6 +319,8 @@ def scrape() -> Dict:
         if prev_count > 0:
             mode_desc += f" (skipping {prev_count} already scraped)"
 
+    SCRAPE_STATE["keyword"] = keyword
+    SCRAPE_STATE["location"] = location
     SCRAPE_STATE["running"] = True
     SCRAPE_STATE["status"] = "running"
     SCRAPE_STATE["message"] = f"🔍 {mode_desc} scraping for '{keyword}' in '{location}'"
@@ -490,7 +494,19 @@ def scrape() -> Dict:
 def download_csv():
     csv_path = SCRAPE_STATE.get("csv_path")
     if not csv_path or not os.path.exists(csv_path):
-        return jsonify({"error": "No CSV file available. Run scraping first."}), 404
+        results = SCRAPE_STATE.get("results") or []
+        if results:
+            try:
+                csv_path = _write_csv(
+                    SCRAPE_STATE.get("keyword", ""),
+                    SCRAPE_STATE.get("location", ""),
+                    results,
+                )
+                SCRAPE_STATE["csv_path"] = csv_path
+            except Exception as exc:
+                log.error("Failed to create CSV for download: %s", exc)
+        if not csv_path or not os.path.exists(csv_path):
+            return jsonify({"error": "No CSV file available. Run scraping first."}), 404
     return send_file(csv_path, as_attachment=True)
 
 
@@ -874,7 +890,13 @@ def _enrich_missing_emails(results: List[Dict[str, str]]) -> List[Dict[str, str]
 
         try:
             extractor = WebsiteExtractor(timeout=8)
-            enriched = extractor.enrich(website, fallback_phone=fallback_phone)
+            enriched = extractor.enrich(
+                website,
+                fallback_phone=fallback_phone,
+                max_pages=5,
+                max_total_time_sec=12,
+                priority_only=True,
+            )
             return host_key, {
                 "email": str(enriched.get("email") or "").strip(),
                 "whatsapp": str(enriched.get("whatsapp") or "").strip(),
